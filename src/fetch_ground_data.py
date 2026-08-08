@@ -46,6 +46,11 @@ CITIES = [
         "coords":   "24.8607,67.0011",
         "out_csv":  "data/raw/ground_pm25_karachi.csv",
     },
+    {
+        "name":     "Mumbai",
+        "coords":   "19.0760,72.8777",
+        "out_csv":  "data/raw/ground_pm25_mumbai.csv",
+    },
 ]
 
 HEADERS = {"X-API-Key": _API_KEY} if _API_KEY else {}

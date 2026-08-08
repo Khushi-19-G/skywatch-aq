@@ -30,6 +30,7 @@ OUT_CSV = "data/processed/weather.csv"
 CITIES = {
     "Delhi":   {"latitude": 28.6139, "longitude": 77.2090, "timezone": "Asia/Kolkata"},
     "Karachi": {"latitude": 24.8607, "longitude": 67.0011, "timezone": "Asia/Karachi"},
+    "Mumbai":  {"latitude": 19.0760, "longitude": 72.8777, "timezone": "Asia/Kolkata"},
 }
 
 DAILY_VARS = [

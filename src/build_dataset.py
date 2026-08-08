@@ -25,6 +25,7 @@ import matplotlib.patches as mpatches
 AOD_CSV       = "data/processed/satellite_aod.csv"
 DELHI_CSV     = "data/raw/ground_pm25_delhi.csv"
 KARACHI_CSV   = "data/raw/ground_pm25_karachi.csv"
+MUMBAI_CSV    = "data/raw/ground_pm25_mumbai.csv"
 WEATHER_CSV   = "data/processed/weather.csv"
 TRAINING_CSV  = "data/processed/training_data.csv"
 SCATTER_PNG   = "data/processed/aod_vs_pm25.png"
@@ -188,12 +189,12 @@ def audit(joined: list[dict]) -> None:
     print("\n" + "=" * 68)
     print("DATASET AUDIT")
     print("=" * 68)
-    print(f"Total matched rows (both cities): {len(joined):,}")
+    print(f"Total matched rows (all cities): {len(joined):,}")
 
     by_city = collections.defaultdict(list)
     for r in joined: by_city[r["city"]].append(r)
 
-    for city in ["Delhi", "Karachi"]:
+    for city in sorted(by_city.keys()):
         rows = by_city.get(city, [])
         if not rows:
             print(f"\n[{city}] no matched rows"); continue
@@ -238,7 +239,7 @@ def audit(joined: list[dict]) -> None:
 # Scatter plot
 # ---------------------------------------------------------------------------
 
-CITY_COLORS = {"Delhi": "#e05c2a", "Karachi": "#2a7ae0"}
+CITY_COLORS = {"Delhi": "#e05c2a", "Karachi": "#2a7ae0", "Mumbai": "#2aae6e"}
 
 def scatter_plot(joined: list[dict], out_path: str) -> None:
     fig, ax = plt.subplots(figsize=(8, 6))
@@ -249,7 +250,7 @@ def scatter_plot(joined: list[dict], out_path: str) -> None:
     by_city = collections.defaultdict(list)
     for r in joined: by_city[r["city"]].append(r)
 
-    for city, rows in by_city.items():
+    for city, rows in sorted(by_city.items()):
         ax.scatter([r["aod_055"] for r in rows],
                    [r["pm25_daily_avg"] for r in rows],
                    color=CITY_COLORS.get(city, "grey"),
@@ -257,11 +258,11 @@ def scatter_plot(joined: list[dict], out_path: str) -> None:
 
     ax.set_xlabel("MODIS MAIAC AOD at 0.55 um", fontsize=11)
     ax.set_ylabel("Ground PM2.5 (ug/m3)", fontsize=11)
-    ax.set_title("Satellite AOD vs. Ground-level PM2.5\n"
-                 "Delhi & Karachi  2023-2025", fontsize=12)
+    city_list = ", ".join(sorted(by_city.keys()))
+    ax.set_title(f"Satellite AOD vs. Ground-level PM2.5\n{city_list}  2023–2025", fontsize=12)
 
-    handles = [mpatches.Patch(color=CITY_COLORS[c], label=c)
-               for c in ["Delhi", "Karachi"] if c in by_city]
+    handles = [mpatches.Patch(color=CITY_COLORS.get(c, "grey"), label=c)
+               for c in sorted(by_city.keys())]
     ax.legend(handles=handles, fontsize=10, framealpha=0.9)
 
     y_pos = 0.97
@@ -307,7 +308,7 @@ def save_training(joined: list[dict], path: str) -> None:
 
 def main() -> None:
     print("Loading CSVs...")
-    ground  = load_ground([("Delhi", DELHI_CSV), ("Karachi", KARACHI_CSV)])
+    ground  = load_ground([("Delhi", DELHI_CSV), ("Karachi", KARACHI_CSV), ("Mumbai", MUMBAI_CSV)])
     aod     = load_aod()
     weather = load_weather()
     print(f"  Ground  rows indexed : {len(ground):,}")

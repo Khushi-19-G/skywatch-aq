@@ -1,20 +1,18 @@
 """
-train_model.py  (iteration 2)
+train_model.py  (iteration 3)
 ------------------------------
-Changes from v1
-  - Target: log1p(pm25_daily_avg); metrics back-transformed to µg/m³
-  - Features: lat/lon removed; geo context replaced by weather + season
-  - Delhi eval: 5-fold GroupKFold, grouped by date (no leakage)
-  - Karachi eval A: zero-shot transfer (Delhi-only train)
-  - Karachi eval B: one-monitor calibration (Delhi + earliest 20% Karachi dates)
-  - Better model (by Delhi CV R²) saved to models/pm25_model.pkl
-    trained on Delhi + Karachi-calibration slice
+Changes from v2
+  - Training set: Delhi + Mumbai  (Karachi held out for transfer evaluation)
+  - GroupKFold CV run on the full Delhi+Mumbai training set, grouped by date
+  - Karachi eval A: zero-shot  (train on Delhi+Mumbai, test all Karachi)
+  - Karachi eval B: one-monitor calibration (Delhi+Mumbai + earliest 20% Karachi dates)
+  - Final saved model trained on Delhi + Mumbai + Karachi-calibration slice
 
 Outputs
 -------
-  models/pm25_model.pkl          joblib bundle: model + features + metadata
-  data/processed/eval_delhi.png  predicted-vs-actual (Delhi OOF predictions)
-  data/processed/eval_karachi.png  same (Karachi scenario b)
+  models/pm25_model.pkl              joblib bundle: model + features + metadata
+  data/processed/eval_train.png      predicted-vs-actual OOF on Delhi+Mumbai
+  data/processed/eval_karachi.png    Karachi scenario B scatter
 """
 
 import csv
@@ -38,7 +36,7 @@ from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 
 TRAINING_CSV = "data/processed/training_data.csv"
 MODEL_PKL    = "models/pm25_model.pkl"
-EVAL_DELHI   = "data/processed/eval_delhi.png"
+EVAL_TRAIN   = "data/processed/eval_train.png"
 EVAL_KARACHI = "data/processed/eval_karachi.png"
 
 SEASON_ENCODE = {"winter": 0, "spring": 1, "monsoon": 2, "autumn": 3}
@@ -59,7 +57,7 @@ FEATURE_COLS = [
 
 TARGET_COL = "pm25_daily_avg"
 
-N_FOLDS        = 5
+N_FOLDS         = 5
 KARACHI_CAL_PCT = 0.20   # fraction of earliest Karachi dates used for calibration
 
 # ---------------------------------------------------------------------------
@@ -77,7 +75,7 @@ def load_rows(path: str) -> list[dict]:
     ]
     for r in rows:
         for c in float_cols: r[c] = float(r[c])
-        r["month"]      = int(r["month"])
+        r["month"]       = int(r["month"])
         r["day_of_year"] = int(r["day_of_year"])
         r["day_of_week"] = int(r["day_of_week"])
         r["season_enc"]  = SEASON_ENCODE[r["season"]]
@@ -99,7 +97,6 @@ def eval_metrics(y_log_true: np.ndarray, y_log_pred: np.ndarray) -> dict:
     """Back-transform both arrays, then compute metrics in original units."""
     yt = np.expm1(y_log_true)
     yp = np.expm1(y_log_pred)
-    # Clip predictions to [0, ∞) — log model can produce tiny negatives near 0
     yp = np.clip(yp, 0, None)
     return {
         "R2":   r2_score(yt, yp),
@@ -115,10 +112,10 @@ def naive_metrics(y_log_train: np.ndarray, y_log_test: np.ndarray) -> dict:
     return eval_metrics(y_log_test, pred)
 
 # ---------------------------------------------------------------------------
-# GroupKFold Delhi CV
+# GroupKFold CV (Delhi + Mumbai combined)
 # ---------------------------------------------------------------------------
 
-def delhi_cv(
+def train_cv(
     model_factory,
     X: np.ndarray,
     y: np.ndarray,
@@ -126,8 +123,7 @@ def delhi_cv(
     n_splits: int = N_FOLDS,
 ) -> tuple[dict, np.ndarray, np.ndarray]:
     """
-    5-fold GroupKFold on Delhi data (groups = integer date codes so all rows
-    with the same date stay together).
+    N-fold GroupKFold on training data (groups = integer date codes).
     Returns fold_stats dict, out-of-fold true values (original units),
     and out-of-fold predicted values (original units).
     """
@@ -174,11 +170,11 @@ def karachi_split(
 
 SEP = "  " + "-" * 66
 
-def print_cv_results(model_name: str, cv: dict, naive: dict) -> None:
-    print(f"\n  *** {model_name}  —  Delhi 5-fold GroupKFold CV ***")
+def print_cv_results(model_name: str, label: str, cv: dict, naive: dict) -> None:
+    print(f"\n  *** {model_name}  —  {label}  {N_FOLDS}-fold GroupKFold CV ***")
     print(f"  {'Metric':<8}  {'Mean':>8}  {'±Std':>7}  |  Naive baseline")
     print(SEP)
-    for metric, naive_key in [("R2","R2"), ("RMSE","RMSE"), ("MAE","MAE")]:
+    for metric in ("R2", "RMSE", "MAE"):
         mu  = cv[f"{metric}_mean"]
         sd  = cv[f"{metric}_std"]
         nv  = naive[metric]
@@ -197,7 +193,7 @@ def print_transfer_block(model_name: str, scenario: str, met: dict, naive: dict)
 
 
 def print_importances(importances: np.ndarray, label: str) -> None:
-    print(f"\n  [{label}] Permutation feature importances (mean ΔR²)")
+    print(f"\n  [{label}] Permutation feature importances (mean delta-R2)")
     print(f"  {'Feature':<32}  Importance")
     print(f"  {'-'*32}  ----------")
     for i in np.argsort(importances)[::-1]:
@@ -265,24 +261,33 @@ MODELS = {
 
 def main() -> None:
     print("=" * 68)
-    print("skywatch-aq  |  PM2.5 model training  (iteration 2)")
+    print("skywatch-aq  |  PM2.5 model training  (iteration 3)")
     print("=" * 68)
-    print(f"Target      : log1p(pm25_daily_avg)  → metrics back-transformed to ug/m3")
+    print(f"Target      : log1p(pm25_daily_avg)  -> metrics back-transformed to ug/m3")
+    print(f"Train set   : Delhi + Mumbai")
+    print(f"Transfer    : Karachi (zero-shot + 20% calibration)")
     print(f"Features    : {FEATURE_COLS}")
 
     # ---- Load ----
     rows    = load_rows(TRAINING_CSV)
     delhi   = [r for r in rows if r["city"] == "Delhi"]
     karachi = [r for r in rows if r["city"] == "Karachi"]
-    print(f"\nDelhi rows  : {len(delhi):,}  |  Karachi rows: {len(karachi):,}")
+    mumbai  = [r for r in rows if r["city"] == "Mumbai"]
+    print(f"\nDelhi rows  : {len(delhi):,}")
+    print(f"Mumbai rows : {len(mumbai):,}")
+    print(f"Karachi rows: {len(karachi):,}")
 
-    X_d, y_d = to_arrays(delhi)
+    # Combined Delhi + Mumbai training set
+    train_rows = delhi + mumbai
+    X_tr, y_tr = to_arrays(train_rows)
+
+    # Date + city combined key -> integer group code (prevent train/val leakage
+    # across dates even when the same date appears in both cities)
+    unique_date_city = sorted({(r["date"], r["city"]) for r in train_rows})
+    dc_to_group      = {dc: i for i, dc in enumerate(unique_date_city)}
+    groups_tr        = np.array([dc_to_group[(r["date"], r["city"])] for r in train_rows])
+
     X_k, y_k = to_arrays(karachi)
-
-    # Date → integer group code for Delhi GroupKFold
-    unique_dates_d   = sorted({r["date"] for r in delhi})
-    date_to_group    = {d: i for i, d in enumerate(unique_dates_d)}
-    groups_d         = np.array([date_to_group[r["date"]] for r in delhi])
 
     # Karachi split: cal 20% / test 80% by date
     k_cal_rows, k_test_rows = karachi_split(karachi)
@@ -291,35 +296,33 @@ def main() -> None:
     print(f"Karachi cal : {len(k_cal_rows):,} rows ({len({r['date'] for r in k_cal_rows})} dates)")
     print(f"Karachi test: {len(k_test_rows):,} rows ({len({r['date'] for r in k_test_rows})} dates)")
 
-    # ---- Delhi CV ----
-    print("\n" + "=" * 68)
-    print("DELHI  —  5-fold GroupKFold cross-validation")
-    print("=" * 68)
-
-    cv_results: dict[str, dict] = {}
-    naive_delhi = naive_metrics(y_d, y_d)  # same distribution (upper bound of naive)
-    # Proper naive: use per-fold held-out distribution — approximate with overall mean
-    naive_delhi_cv = {
-        "R2": r2_score(np.expm1(y_d),
-                       np.full(len(y_d), np.expm1(y_d).mean())),
+    # Naive baseline for training set
+    naive_tr_cv = {
+        "R2":   r2_score(np.expm1(y_tr), np.full(len(y_tr), np.expm1(y_tr).mean())),
         "RMSE": math.sqrt(mean_squared_error(
-                    np.expm1(y_d), np.full(len(y_d), np.expm1(y_d).mean()))),
+                    np.expm1(y_tr), np.full(len(y_tr), np.expm1(y_tr).mean()))),
         "MAE":  mean_absolute_error(
-                    np.expm1(y_d), np.full(len(y_d), np.expm1(y_d).mean())),
+                    np.expm1(y_tr), np.full(len(y_tr), np.expm1(y_tr).mean())),
     }
 
-    oof_preds: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    # ---- Training CV (Delhi + Mumbai) ----
+    print("\n" + "=" * 68)
+    print("DELHI + MUMBAI  —  5-fold GroupKFold cross-validation")
+    print("=" * 68)
+
+    cv_results: dict[str, dict]                    = {}
+    oof_preds:  dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
     for name, factory in MODELS.items():
-        cv, oof_true, oof_pred = delhi_cv(factory, X_d, y_d, groups_d)
+        cv, oof_true, oof_pred = train_cv(factory, X_tr, y_tr, groups_tr)
         cv_results[name] = cv
         oof_preds[name]  = (oof_true, oof_pred)
-        print_cv_results(name, cv, naive_delhi_cv)
+        print_cv_results(name, "Delhi+Mumbai", cv, naive_tr_cv)
 
-    # Best model = highest mean Delhi CV R²
+    # Best model = highest mean CV R²
     best_name = max(cv_results, key=lambda n: cv_results[n]["R2_mean"])
     best_cv   = cv_results[best_name]
-    print(f"\n  --> Best by Delhi CV R²: {best_name}  "
+    print(f"\n  --> Best by CV R²: {best_name}  "
           f"(mean R² = {best_cv['R2_mean']:.4f})")
 
     # ---- Karachi transfer ----
@@ -329,30 +332,31 @@ def main() -> None:
 
     best_factory = MODELS[best_name]
 
-    # Scenario A: zero-shot (train on all Delhi, test on all Karachi)
+    # Scenario A: zero-shot (train on Delhi+Mumbai, test on all Karachi)
     m_a = best_factory()
-    m_a.fit(X_d, y_d)
+    m_a.fit(X_tr, y_tr)
     pred_ka  = m_a.predict(X_k)
     met_ka   = eval_metrics(y_k, pred_ka)
-    naive_ka = naive_metrics(y_d, y_k)
-    print_transfer_block(best_name, "A: zero-shot transfer (all Delhi -> all Karachi)", met_ka, naive_ka)
+    naive_ka = naive_metrics(y_tr, y_k)
+    print_transfer_block(best_name,
+        "A: zero-shot transfer (Delhi+Mumbai -> all Karachi)", met_ka, naive_ka)
 
-    # Scenario B: one-monitor calibration (all Delhi + Karachi cal 20%)
-    X_train_b = np.vstack([X_d, X_kc])
-    y_train_b = np.concatenate([y_d, y_kc])
+    # Scenario B: calibration (Delhi+Mumbai + 20% Karachi cal -> remaining Karachi)
+    X_train_b = np.vstack([X_tr, X_kc])
+    y_train_b = np.concatenate([y_tr, y_kc])
     m_b = best_factory()
     m_b.fit(X_train_b, y_train_b)
     pred_kb  = m_b.predict(X_kt)
     met_kb   = eval_metrics(y_kt, pred_kb)
     naive_kb = naive_metrics(y_train_b, y_kt)
     print_transfer_block(best_name,
-        f"B: one-monitor calibration (Delhi + {KARACHI_CAL_PCT*100:.0f}% Karachi cal -> remaining Karachi)",
+        f"B: one-monitor calibration (Delhi+Mumbai + {KARACHI_CAL_PCT*100:.0f}% Karachi cal -> remaining Karachi)",
         met_kb, naive_kb)
 
-    # ---- Feature importances (permutation on full Delhi) ----
-    print(f"\nComputing permutation importances on Delhi (n={len(X_d):,})...")
+    # ---- Feature importances (permutation on training set) ----
+    print(f"\nComputing permutation importances on Delhi+Mumbai (n={len(X_tr):,})...")
     perm = permutation_importance(
-        m_a, X_d, y_d, n_repeats=10, random_state=42, n_jobs=-1, scoring="r2",
+        m_a, X_tr, y_tr, n_repeats=10, random_state=42, n_jobs=-1, scoring="r2",
     )
     print_importances(perm.importances_mean, best_name)
 
@@ -360,35 +364,37 @@ def main() -> None:
     oof_t, oof_p = oof_preds[best_name]
     scatter_eval(
         oof_t, oof_p,
-        title=f"{best_name}  —  Delhi 5-fold OOF\n(all Delhi, grouped by date)",
-        out_path=EVAL_DELHI,
+        title=f"{best_name}  —  Delhi+Mumbai {N_FOLDS}-fold OOF\n(grouped by date+city)",
+        out_path=EVAL_TRAIN,
         r2=best_cv["R2_mean"], rmse_val=best_cv["RMSE_mean"],
-        color="#e05c2a",
+        color="#7c5cd8",
     )
-    y_kt_orig   = np.expm1(y_kt)
-    y_kb_pred   = np.clip(np.expm1(pred_kb), 0, None)
+    y_kt_orig = np.expm1(y_kt)
+    y_kb_pred = np.clip(np.expm1(pred_kb), 0, None)
     scatter_eval(
         y_kt_orig, y_kb_pred,
-        title=f"{best_name}  —  Karachi scenario B\n(Delhi + {KARACHI_CAL_PCT*100:.0f}% cal -> held-out Karachi)",
+        title=f"{best_name}  —  Karachi scenario B\n(Delhi+Mumbai + {KARACHI_CAL_PCT*100:.0f}% cal -> held-out Karachi)",
         out_path=EVAL_KARACHI,
         r2=met_kb["R2"], rmse_val=met_kb["RMSE"],
         color="#2a7ae0",
     )
 
     # ---- Save final model ----
-    # Retrain best model on Delhi + Karachi calibration slice (scenario B training set)
-    print(f"\nRetraining {best_name} on Delhi + Karachi-cal ({len(X_train_b):,} rows) for deployment...")
+    # Final model trained on Delhi + Mumbai + Karachi calibration slice
+    print(f"\nRetraining {best_name} on Delhi+Mumbai+Karachi-cal "
+          f"({len(X_train_b):,} rows) for deployment...")
     m_final = best_factory()
     m_final.fit(X_train_b, y_train_b)
 
     pathlib.Path(MODEL_PKL).parent.mkdir(parents=True, exist_ok=True)
     joblib.dump({
-        "model":         m_final,
-        "features":      FEATURE_COLS,
-        "target":        TARGET_COL,
+        "model":            m_final,
+        "features":         FEATURE_COLS,
+        "target":           TARGET_COL,
         "target_transform": "log1p",
-        "season_encode": SEASON_ENCODE,
-        "model_name":    best_name,
+        "season_encode":    SEASON_ENCODE,
+        "model_name":       best_name,
+        "train_cities":     ["Delhi", "Mumbai", "Karachi-cal"],
     }, MODEL_PKL)
     print(f"  Model saved -> {MODEL_PKL}")
     print("\nDone.")

@@ -78,6 +78,7 @@ DATE_TO   = "2025-07-31"
 GROUND_CSVS = {
     "Delhi":   "data/raw/ground_pm25_delhi.csv",
     "Karachi": "data/raw/ground_pm25_karachi.csv",
+    "Mumbai":  "data/raw/ground_pm25_mumbai.csv",
 }
 
 RAW_OUT      = "data/raw/satellite_aod_raw.csv"
@@ -403,7 +404,7 @@ def print_summary(daily_rows: list[dict], locations: list[dict]) -> None:
     print("=" * 60)
 
     total_location_days = 0
-    for city in ["Delhi", "Karachi"]:
+    for city in sorted({l["city"] for l in locations}):
         city_locs = [l for l in locations if l["city"] == city]
         city_rows = [r for r in daily_rows if r["city"] == city]
         if not city_rows or not city_locs:
@@ -484,47 +485,69 @@ def main() -> None:
 
     # --- Resume support: load any rows already saved in RAW_OUT ---
     raw_rows: list[dict] = []
-    already_done: set[tuple] = set()   # (date, location_id) pairs already extracted
     raw_out_path = pathlib.Path(RAW_OUT)
     if raw_out_path.exists() and raw_out_path.stat().st_size > 0:
         with open(raw_out_path, newline="", encoding="utf-8") as rf:
             for row in csv.DictReader(rf):
                 raw_rows.append(row)
-                already_done.add((row["date"], row["location_id"]))
+        n_dates = len({r["date"] for r in raw_rows})
         print(f"\nResume: loaded {len(raw_rows):,} existing raw rows "
-              f"({len({r['date'] for r in raw_rows})} dates already done).")
+              f"({n_dates} dates already done).")
     else:
         print(f"\nStarting fresh (no existing {RAW_OUT}).")
 
-    # Determine which dates still need processing
-    dates_done_set: set[str] = {r["date"] for r in raw_rows}
+    # Track done dates PER TILE so adding a new tile fetches all dates for it,
+    # even if those dates are already recorded for other tiles.
+    tile_dates_done: dict[str, set[str]] = {}
+    for r in raw_rows:
+        # Determine which tile this row belongs to by looking up its location
+        loc_lid = r["location_id"]
+        for tid, locs in tile_to_locs.items():
+            if any(str(l["location_id"]) == loc_lid for l in locs):
+                tile_dates_done.setdefault(tid, set()).add(r["date"])
+                break
+
+    for tid in tile_to_locs:
+        n = len(tile_dates_done.get(tid, set()))
+        print(f"  Tile {tid}: {n} dates already in raw CSV.")
 
     print(f"\nProcessing {len(months)} months x {len(tile_to_locs)} tile(s)  "
-          f"({len(all_dates)} days total, {len(dates_done_set)} already done)...")
+          f"({len(all_dates)} total days)...")
 
     new_rows: list[dict] = []
 
     for month_num, (year, month) in enumerate(months, 1):
         mo_str = f"{year:04d}-{month:02d}"
-        # Check whether any day in this month still needs work
         import calendar as _cal
         last_day = _cal.monthrange(year, month)[1]
         mo_dates = {f"{year:04d}-{month:02d}-{d:02d}" for d in range(1, last_day + 1)}
-        pending  = mo_dates & all_dates_set - dates_done_set
-        if not pending:
-            continue   # entire month already processed
 
-        print(f"  Month {month_num}/{len(months)} : {mo_str}  "
-              f"({len(pending)} days pending, {len(new_rows):,} new rows so far)")
+        # Check if any tile still has pending days this month
+        month_has_work = False
+        for tid in tile_to_locs:
+            done_for_tile = tile_dates_done.get(tid, set())
+            if mo_dates & all_dates_set - done_for_tile:
+                month_has_work = True
+                break
+        if not month_has_work:
+            continue
+
+        print(f"  Month {month_num}/{len(months)} : {mo_str}  ({len(new_rows):,} new rows so far)")
 
         for tid, locs in tile_to_locs.items():
+            done_for_tile = tile_dates_done.setdefault(tid, set())
+            pending = mo_dates & all_dates_set - done_for_tile
+            if not pending:
+                print(f"    Tile {tid}: all days already done, skipping.")
+                continue
+
             # One CMR search for the whole month
             granule_map = search_granules_for_tile_month(tid, year, month)
             if not granule_map:
                 print(f"    Tile {tid}: no granules found for {mo_str}")
                 continue
 
-            print(f"    Tile {tid}: {len(granule_map)} granules found")
+            print(f"    Tile {tid}: {len(granule_map)} granules found, {len(pending)} days pending")
 
             for date_str, granule in sorted(granule_map.items()):
                 if date_str not in pending:
@@ -534,7 +557,12 @@ def main() -> None:
                     continue
                 orbit_rows = extract_aod_pixels(hdf_path, locs)
                 new_rows.extend(orbit_rows)
-                dates_done_set.add(date_str)
+                done_for_tile.add(date_str)
+                # Delete HDF after extraction to stay under 2 GB disk budget
+                try:
+                    hdf_path.unlink()
+                except OSError:
+                    pass
 
             time.sleep(DOWNLOAD_DELAY_S)
 
