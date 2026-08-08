@@ -1,0 +1,38 @@
+﻿# Environment & secrets
+.env
+
+# Data directories (large / generated files)
+data/raw/
+data/processed/
+
+# Trained models
+models/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Serialised model artefacts
+*.pkl
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
