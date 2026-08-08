@@ -190,7 +190,8 @@ def search_granules_for_tile_month(tile: str, year: int, month: int) -> dict[str
         version="061",
         temporal=(start, end),
         bounding_box=(lon_min, lat_min, lon_max, lat_max),
-        count=40,          # up to 31 days x 1 tile = <=31; 40 is safe
+        count=1000,        # bounding-box overlaps multiple tiles; need high count
+                           # so after tile-name filtering we get every day (<=31)
     )
     # Index by date string parsed from filename (A2023001 -> 2023-01-01)
     by_date: dict[str, object] = {}
@@ -290,7 +291,8 @@ def extract_aod_pixels(
             if not (0 <= tp.row < PIX_PER_TILE and 0 <= tp.col < PIX_PER_TILE):
                 continue   # out of bounds
 
-            for orbit_idx in range(2):
+            n_orbits = aod_arr.shape[0]
+            for orbit_idx in range(n_orbits):
                 orbit_name = "Terra" if orbit_idx == 0 else "Aqua"
 
                 aod_val = aod_arr[orbit_idx, tp.row, tp.col]
@@ -338,7 +340,7 @@ def aggregate_daily(raw_rows: list[dict]) -> list[dict]:
 
     for r in raw_rows:
         key = (r["date"], r["location_id"])
-        groups.setdefault(key, []).append(r["aod_055_raw"])
+        groups.setdefault(key, []).append(float(r["aod_055_raw"]))
         if key not in meta:
             meta[key] = {
                 "date":          r["date"],
