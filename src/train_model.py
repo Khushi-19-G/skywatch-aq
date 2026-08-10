@@ -34,10 +34,11 @@ from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 # Config
 # ---------------------------------------------------------------------------
 
-TRAINING_CSV = "data/processed/training_data.csv"
-MODEL_PKL    = "models/pm25_model.pkl"
-EVAL_TRAIN   = "data/processed/eval_train.png"
-EVAL_KARACHI = "data/processed/eval_karachi.png"
+TRAINING_CSV  = "data/processed/training_data.csv"
+MODEL_PKL     = "models/pm25_model.pkl"
+EVAL_TRAIN    = "data/processed/eval_train.png"
+EVAL_KARACHI  = "data/processed/eval_karachi.png"
+BAND_ACC_TXT  = "data/processed/band_accuracy.txt"
 
 SEASON_ENCODE = {"winter": 0, "spring": 1, "monsoon": 2, "autumn": 3}
 
@@ -163,6 +164,119 @@ def karachi_split(
     cal  = [r for r in rows_k if r["date"] in cal_dates]
     test = [r for r in rows_k if r["date"] not in cal_dates]
     return cal, test
+
+# ---------------------------------------------------------------------------
+# Health-band utilities  (mirrors app/app.py CATEGORIES)
+# ---------------------------------------------------------------------------
+
+# (lo, hi, label)  — same thresholds as the app
+HEALTH_BANDS = [
+    (  0,  12,  "Good"),
+    ( 12,  35,  "Moderate"),
+    ( 35,  55,  "USG"),          # Unhealthy for Sensitive Groups
+    ( 55, 150,  "Unhealthy"),
+    (150, 250,  "Very Unhealthy"),
+    (250, float("inf"), "Hazardous"),
+]
+BAND_LABELS = [b[2] for b in HEALTH_BANDS]
+
+
+def pm25_to_band(pm25: float) -> int:
+    """Return integer band index (0..5) for a PM2.5 value in µg/m³."""
+    for i, (lo, hi, _) in enumerate(HEALTH_BANDS):
+        if lo <= pm25 < hi:
+            return i
+    return len(HEALTH_BANDS) - 1   # clamp to Hazardous
+
+
+def band_accuracy(y_true_orig: np.ndarray, y_pred_orig: np.ndarray) -> dict:
+    """
+    Map both arrays to health bands and compute:
+      exact  — fraction where predicted band == actual band
+      within1 — fraction where |predicted_band - actual_band| <= 1
+    Also computes per-band sample counts and exact hits.
+    """
+    n = len(y_true_orig)
+    true_bands = np.array([pm25_to_band(v) for v in y_true_orig])
+    pred_bands = np.array([pm25_to_band(v) for v in y_pred_orig])
+    diff = np.abs(true_bands - pred_bands)
+    exact   = float(np.sum(diff == 0) / n)
+    within1 = float(np.sum(diff <= 1) / n)
+    # per-band breakdown
+    per_band = {}
+    for i, (_, _, lbl) in enumerate(HEALTH_BANDS):
+        mask = true_bands == i
+        if mask.sum() == 0:
+            per_band[lbl] = {"n": 0, "exact": float("nan")}
+        else:
+            per_band[lbl] = {
+                "n":     int(mask.sum()),
+                "exact": float(np.sum(diff[mask] == 0) / mask.sum()),
+            }
+    return {"exact": exact, "within1": within1, "per_band": per_band, "n": n}
+
+
+def print_band_table(
+    rows_data: list[tuple[str, np.ndarray, np.ndarray]],
+    out_path: str,
+) -> None:
+    """
+    rows_data: list of (scenario_label, y_true_orig, y_pred_orig)
+    Prints + writes the band accuracy table.
+    """
+    lines: list[str] = []
+
+    def w(s: str = "") -> None:
+        lines.append(s)
+        print(s)
+
+    w()
+    w("=" * 70)
+    w("HEALTH-BAND ACCURACY")
+    w("=" * 70)
+    w("Bands: Good(0-12) | Moderate(12-35) | USG(35-55) | Unhealthy(55-150)")
+    w("       Very Unhealthy(150-250) | Hazardous(250+)  [PM2.5 ug/m3]")
+    w()
+
+    hdr = f"  {'Scenario':<42}  {'Exact':>6}  {'Within-1':>8}  {'n':>5}"
+    sep = "  " + "-" * 66
+    w(hdr)
+    w(sep)
+
+    for label, y_true, y_pred in rows_data:
+        ba = band_accuracy(y_true, y_pred)
+        w(f"  {label:<42}  {ba['exact']*100:>5.1f}%  {ba['within1']*100:>7.1f}%  {ba['n']:>5,}")
+
+    w()
+    w("Per-band exact accuracy (rows = scenarios, cols = bands):")
+    w()
+
+    # Header row
+    col_w = 14
+    band_hdr = "  " + f"{'Scenario':<32}" + "".join(f"  {lbl:>{col_w}}" for lbl in BAND_LABELS)
+    w(band_hdr)
+    w("  " + "-" * (32 + (col_w + 2) * len(BAND_LABELS)))
+
+    for label, y_true, y_pred in rows_data:
+        ba = band_accuracy(y_true, y_pred)
+        short_label = label[:32]
+        row_str = "  " + f"{short_label:<32}"
+        for lbl in BAND_LABELS:
+            info = ba["per_band"][lbl]
+            if info["n"] == 0:
+                cell = "  n/a"
+            else:
+                cell = f"{info['exact']*100:.0f}% (n={info['n']})"
+            row_str += f"  {cell:>{col_w}}"
+        w(row_str)
+
+    w()
+
+    pathlib.Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print(f"  Band accuracy table saved -> {out_path}")
+
 
 # ---------------------------------------------------------------------------
 # Printing helpers
@@ -360,8 +474,33 @@ def main() -> None:
     )
     print_importances(perm.importances_mean, best_name)
 
-    # ---- Scatter plots ----
+    # ---- Health-band accuracy ----
+    print("\n" + "=" * 68)
+    print("HEALTH-BAND ACCURACY")
+    print("=" * 68)
+
+    # OOF true/pred already in original units from train_cv
     oof_t, oof_p = oof_preds[best_name]
+
+    # Karachi zero-shot in original units
+    y_k_orig  = np.expm1(y_k)
+    y_ka_pred = np.clip(np.expm1(pred_ka), 0, None)
+
+    # Naive band baselines
+    naive_tr_orig  = np.expm1(y_tr)
+    naive_tr_mean  = float(naive_tr_orig.mean())
+    naive_band_tr  = np.full(len(oof_t), naive_tr_mean)   # naive for train CV
+    naive_band_ka  = np.full(len(y_k_orig), naive_tr_mean) # naive for zero-shot
+
+    band_rows = [
+        ("Delhi+Mumbai CV OOF",                oof_t,       oof_p),
+        ("Delhi+Mumbai CV OOF — naive",         oof_t,       naive_band_tr),
+        (f"Karachi zero-shot",                  y_k_orig,    y_ka_pred),
+        (f"Karachi zero-shot — naive",          y_k_orig,    naive_band_ka),
+    ]
+    print_band_table(band_rows, BAND_ACC_TXT)
+
+    # ---- Scatter plots ----
     scatter_eval(
         oof_t, oof_p,
         title=f"{best_name}  —  Delhi+Mumbai {N_FOLDS}-fold OOF\n(grouped by date+city)",

@@ -78,6 +78,42 @@ def season(month: int) -> str:
 SEASON_ENCODE = {"winter": 0, "spring": 1, "monsoon": 2, "autumn": 3}
 
 # ---------------------------------------------------------------------------
+# Region confidence
+# ---------------------------------------------------------------------------
+# Anchor cities used for training/validation, with 500 km radius
+_VALIDATED_ANCHORS = [
+    ("Delhi",   28.6139, 77.2090),
+    ("Mumbai",  19.0760, 72.8777),
+    ("Karachi", 24.8607, 67.0011),
+]
+_VALIDATED_RADIUS_KM = 500.0
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in km between two WGS-84 points."""
+    R = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi  = math.radians(lat2 - lat1)
+    dlam  = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
+
+
+def region_confidence(lat: float, lon: float) -> tuple[bool, str]:
+    """
+    Returns (is_validated, badge_text).
+    Validated if within _VALIDATED_RADIUS_KM of any training anchor.
+    """
+    for name, alat, alon in _VALIDATED_ANCHORS:
+        dist = _haversine_km(lat, lon, alat, alon)
+        if dist <= _VALIDATED_RADIUS_KM:
+            return True, f"Validated region (within {dist:.0f} km of {name})"
+    # Find nearest anchor for context
+    nearest = min(_VALIDATED_ANCHORS, key=lambda a: _haversine_km(lat, lon, a[1], a[2]))
+    dist = _haversine_km(lat, lon, nearest[1], nearest[2])
+    return False, f"Lower confidence — outside the validated region ({dist:.0f} km from {nearest[0]}); estimates are indicative only."
+
+# ---------------------------------------------------------------------------
 # AQI / health categories  (PM2.5 µg/m³)
 # ---------------------------------------------------------------------------
 CATEGORIES = [
@@ -313,7 +349,8 @@ st.set_page_config(
 
 st.title("🌫️ SkyWatch-AQ")
 st.markdown(
-    "**Ground-level PM2.5 estimator for cities without monitoring stations.**  \n"
+    "**Ground-level PM2.5 estimator for cities without monitoring stations "
+    "— validated in South Asia, with regionally varying performance elsewhere.**  \n"
     "Powered by NASA MODIS MAIAC satellite AOD + Open-Meteo weather + a "
     "machine-learning model trained on Delhi and Mumbai air quality data."
 )
@@ -452,9 +489,21 @@ except Exception as e:
 # ---------------------------------------------------------------------------
 st.subheader(f"Results — {city_name}, {date_str}")
 
+# Region confidence badge
+is_validated, conf_text = region_confidence(lat, lon)
+conf_color = "#3b82d4" if is_validated else "#f97316"
+conf_bg    = "#eff6ff" if is_validated else "#fff7ed"
+st.markdown(
+    f'<span style="background:{conf_bg};color:{conf_color};border:1px solid {conf_color};'
+    f'padding:3px 10px;border-radius:12px;font-size:0.82em;font-weight:500;">'
+    f"{'✓' if is_validated else '⚠'} {conf_text}</span>",
+    unsafe_allow_html=True,
+)
+st.write("")   # spacer
+
 col1, col2 = st.columns([2, 3])
 with col1:
-    st.metric("SkyWatch PM2.5 estimate", f"{pm25:.1f} µg/m³")
+    st.metric("SkyWatch PM2.5 estimate", f"{pm25:.1f} µg/m3")
 with col2:
     txt_color = "#1f2328" if color in ("#22c55e", "#84cc16", "#eab308") else "white"
     st.markdown(
