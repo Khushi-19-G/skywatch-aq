@@ -5,8 +5,8 @@
 data/raw/
 data/processed/
 
-# Trained models
-models/
+# Trained models  (all model artefacts ignored except the deployed pkl)
+models/*
 
 # Python cache
 __pycache__/
@@ -36,3 +36,6 @@ Thumbs.db
 # IDEs
 .vscode/
 .idea/
+
+# --- Exception: committed model file (must be LAST so it wins over *.pkl and models/*) ---
+!models/pm25_model.pkl

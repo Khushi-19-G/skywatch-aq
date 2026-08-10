@@ -18,59 +18,37 @@ AppEEARS does NOT carry MCD19A2. Instead we use earthaccess to:
      data/processed/satellite_aod.csv (daily averages, one row per
      location-day that has at least one valid overpass).
 
-MCD19A2 HDF structure (confirmed by probe)
-------------------------------------------
-  Variables: Optical_Depth_055  shape (2, 1200, 1200)  int16 scaled
-             AOD_QA             shape (2, 1200, 1200)  uint16 bitmask
-  Dim-0 (size 2) = Terra overpass [0], Aqua overpass [1]
-  scale_factor = 0.001, add_offset = 0.0
-  fill_value (raw int16) = -28672 (masked automatically by netCDF4)
-  valid_range raw: [-100, 6000]  ->  physical AOD: [-0.1, 6.0]
-
-AOD_QA bitmask (bits 0-2 = Cloud Mask):
-  001 = Clear, 011 = Possibly cloudy, 101 = Cloudy/snow
-  We keep only pixels where cloud mask bits 0-2 != 0 (not undefined)
-  and bits 0-2 in {0b001, 0b011} (Clear or Possibly cloudy).
-  We discard cloudy (101) and undefined (000).
-
-Sinusoidal grid coordinate transform
--------------------------------------
-  RE = 6371007.181 m
-  Tile size = 10 deg * pi/180 * RE metres
-  Pixel size = tile_size_m / 1200
-  For tile (h, v):
-    x_origin = (h - 18) * tile_size_m
-    y_origin = (9  - v) * tile_size_m
-  lat/lon -> row/col:
-    x = RE * lon_rad * cos(lat_rad)
-    y = RE * lat_rad
-    col = (x - x_origin) / pixel_size_m
-    row = (y_origin - y) / pixel_size_m
+Shared geometry / extraction logic lives in src/aod_utils.py.
 """
 
-import os
 import csv
-import math
 import time
 import pathlib
 import datetime
-from typing import NamedTuple
 
 import numpy as np
 import netCDF4 as nc4
-from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
-# Config
+# Config + shared utilities
 # ---------------------------------------------------------------------------
+import sys, os
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from aod_utils import (
+    latlon_to_tile_pixel, tile_id, TilePixel,
+    KEEP_CLOUD_STATES, PIX_PER_TILE,
+    earthaccess_login as _earthaccess_login_fn,
+    download_granule,
+)
+
+from dotenv import load_dotenv
 load_dotenv(override=True)
-# earthaccess reads OS env vars directly; push dotenv values in.
 for _k in ("EARTHDATA_USERNAME", "EARTHDATA_PASSWORD"):
     _v = os.getenv(_k, "")
     if _v:
         os.environ[_k] = _v
 
-import earthaccess  # noqa: E402 — import after env vars are set
+import earthaccess  # noqa: E402
 
 DATE_FROM = "2023-01-01"
 DATE_TO   = "2025-07-31"
@@ -86,48 +64,8 @@ PROCESSED_OUT = "data/processed/satellite_aod.csv"
 
 HDF_CACHE_DIR = pathlib.Path("data/raw/_hdf_cache")
 
-# MODIS sinusoidal constants
-RE = 6371007.181   # authalic sphere radius (m)
-TILE_DEG = 10.0    # degrees per tile
-TILE_M   = TILE_DEG * math.pi / 180.0 * RE
-PIX_PER_TILE = 1200
-PIX_M = TILE_M / PIX_PER_TILE   # ~926.6 m
-
-# AOD_QA cloud-mask bits 0-2: keep 001 (clear) and 011 (possibly cloudy)
-KEEP_CLOUD_STATES = {0b001, 0b011}
-
 # Delay between earthaccess downloads to avoid hammering the server
 DOWNLOAD_DELAY_S = 0.5
-
-
-# ---------------------------------------------------------------------------
-# MODIS sinusoidal helpers
-# ---------------------------------------------------------------------------
-
-class TilePixel(NamedTuple):
-    h: int
-    v: int
-    row: int
-    col: int
-
-
-def latlon_to_tile_pixel(lat_deg: float, lon_deg: float) -> TilePixel:
-    """Convert WGS-84 lat/lon to MODIS sinusoidal tile + pixel row/col."""
-    lat = math.radians(lat_deg)
-    lon = math.radians(lon_deg)
-    x = RE * lon * math.cos(lat)
-    y = RE * lat
-    h = int((x / TILE_M) + 18)
-    v = int(9 - (y / TILE_M))
-    x_origin = (h - 18) * TILE_M
-    y_origin = (9 - v)  * TILE_M
-    col = int((x - x_origin) / PIX_M)
-    row = int((y_origin - y) / PIX_M)
-    return TilePixel(h=h, v=v, row=row, col=col)
-
-
-def tile_id(h: int, v: int) -> str:
-    return f"h{h:02d}v{v:02d}"
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +106,7 @@ def daterange(start: str, end: str):
 # ---------------------------------------------------------------------------
 
 def _earthaccess_login() -> None:
-    earthaccess.login(strategy="environment")
+    _earthaccess_login_fn()
 
 
 def search_granules_for_tile_month(tile: str, year: int, month: int) -> dict[str, object]:
@@ -217,33 +155,8 @@ def search_granules_for_tile_month(tile: str, year: int, month: int) -> dict[str
     return by_date
 
 
-def download_granule(granule, cache_dir: pathlib.Path, retries: int = 3) -> pathlib.Path | None:
-    """Download a granule to cache_dir (skip if already present). Returns path."""
-    urls = granule.data_links()
-    if not urls:
-        return None
-    filename = urls[0].split("/")[-1]
-    dest = cache_dir / filename
-    if dest.exists() and dest.stat().st_size > 0:
-        return dest
-    for attempt in range(retries):
-        try:
-            files = earthaccess.download([granule], local_path=str(cache_dir))
-            if files:
-                p = pathlib.Path(files[0])
-                if p.exists() and p.stat().st_size > 0:
-                    return p
-        except Exception as exc:
-            wait = 15 * (attempt + 1)
-            print(f"    [download error attempt {attempt+1}/{retries}] {type(exc).__name__}: {str(exc)[:120]}")
-            if attempt < retries - 1:
-                print(f"    retrying in {wait}s...")
-                time.sleep(wait)
-    return None
-
-
 # ---------------------------------------------------------------------------
-# HDF pixel extraction
+# HDF pixel extraction  (bulk, multi-location version)
 # ---------------------------------------------------------------------------
 
 def extract_aod_pixels(
