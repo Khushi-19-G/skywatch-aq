@@ -41,6 +41,7 @@ import time
 import requests
 import numpy as np
 import netCDF4 as nc4
+from global_land_mask import globe as _globe
 
 # ---------------------------------------------------------------------------
 # Shared geometry from aod_utils
@@ -56,7 +57,12 @@ from aod_utils import (
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-GRID_STEP = 24          # sample 1 pixel every GRID_STEP -> 50×50 grid
+GRID_STEP = 24          # sample 1 pixel every GRID_STEP -> 50x50 grid
+
+# Land-mask: exclude over-water cells — model was trained on land monitors only
+def _is_land(lat: float, lon: float) -> bool:
+    return bool(_globe.is_land(lat, lon))
+
 # Step for the weather grid in degrees
 WEATHER_DEG_STEP = 1.0  # degrees between weather query points
 
@@ -86,6 +92,7 @@ WEATHER_VARS = [
 # ---------------------------------------------------------------------------
 # Each region maps to one MODIS tile.
 # centre_lat/lon is the map zoom centre; label shown in the UI.
+# n_land is computed at module load (fast in-memory land-mask lookup).
 REGIONS = {
     "h24v06": {
         "label":      "Delhi / Karachi region (NW India + Pakistan)",
@@ -110,6 +117,18 @@ REGIONS = {
     },
 }
 
+# Populate n_land for each region (counted once at import time).
+# pixel_to_latlon is defined below — we use a forward reference via a helper
+# that we fill in after the function is defined.
+def _count_land_cells(tile: str, step: int = GRID_STEP) -> int:
+    h = int(tile[1:3]); v = int(tile[4:6])
+    return sum(
+        1
+        for r in range(0, PIX_PER_TILE, step)
+        for c in range(0, PIX_PER_TILE, step)
+        if _is_land(*pixel_to_latlon(h, v, r, c))
+    )
+
 # ---------------------------------------------------------------------------
 # Sinusoidal -> lat/lon inverse transform
 # ---------------------------------------------------------------------------
@@ -131,6 +150,11 @@ def pixel_to_latlon(h_tile: int, v_tile: int, row: int, col: int) -> tuple[float
     else:
         lon = math.degrees(x / (RE * cos_lat))
     return lat, lon
+
+
+# n_land is now safe to compute (pixel_to_latlon is defined above).
+for _rk, _rv in REGIONS.items():
+    _rv["n_land"] = _count_land_cells(_rv["tile"])
 
 # ---------------------------------------------------------------------------
 # AOD grid extraction from one HDF granule
@@ -166,6 +190,10 @@ def extract_aod_grid(
 
         for row in row_indices:
             for col in col_indices:
+                lat, lon = pixel_to_latlon(h_tile, v_tile, row, col)
+                if not _is_land(lat, lon):
+                    continue   # skip ocean / sea cells
+
                 valid_aods: list[float] = []
                 for orbit in range(n_orbits):
                     val = aod_arr[orbit, row, col]
@@ -185,7 +213,6 @@ def extract_aod_grid(
                     continue   # cloud / no data — skip cell
 
                 mean_aod = round(sum(valid_aods) / len(valid_aods), 4)
-                lat, lon = pixel_to_latlon(h_tile, v_tile, row, col)
                 cells.append({
                     "row": row,
                     "col": col,
@@ -467,7 +494,8 @@ def build_region_map(
     # 2. Extract AOD grid
     log(f"[map] Extracting AOD grid (step={GRID_STEP}, ~50x50 cells)...")
     cells = extract_aod_grid(hdf_path, h_tile, v_tile, step=GRID_STEP)
-    log(f"[map] Valid cells (non-cloudy): {len(cells):,} / {(PIX_PER_TILE // GRID_STEP) ** 2}")
+    n_land = region.get("n_land", (PIX_PER_TILE // GRID_STEP) ** 2)
+    log(f"[map] Valid cells (land, non-cloudy): {len(cells):,} / {n_land} land cells")
 
     # Delete HDF to keep disk footprint low
     try:

@@ -419,13 +419,14 @@ def _cells_to_figure(cells: list[dict], region_key: str, date_str: str) -> go.Fi
             legendgroup=city["name"],
         ))
 
-    n_cells    = len(cells)
-    n_possible = 2500   # 50x50
-    pct        = 100 * n_cells / n_possible
+    n_cells = len(cells)
+    # n_land was computed at map_utils import time and stored in REGIONS.
+    n_land  = REGIONS.get(region_key, {}).get("n_land", 2500)
+    pct     = 100 * n_cells / max(n_land, 1)
     title_text = (
         f"Estimated air quality — {region['label']}, {date_str}<br>"
-        f"<sup>{n_cells:,}/{n_possible:,} cells have satellite data ({pct:.0f}%); "
-        f"grey gaps = cloud cover (no satellite view). "
+        f"<sup>{n_cells:,} of {n_land:,} land cells have satellite data ({pct:.0f}%); "
+        f"grey gaps = cloud cover or ocean (no estimate). "
         f"Every coloured cell is a model estimate — most locations have no ground monitor.</sup>"
     )
 
@@ -517,12 +518,18 @@ with tab_map:
             st.markdown("""
 **Resolution:** ~22 km per cell (1 MODIS pixel sampled every 24 pixels).
 
-**Cloud gaps:** Cells where no Terra or Aqua overpass returned QA-valid AOD
-are shown as map background (no coloured point). On heavy cloud days
-(monsoon) the map may be mostly empty — this is correct behaviour.
+**Land mask:** Only land cells are shown. Ocean, sea, and large inland
+water bodies are excluded because the model was trained exclusively on
+land-based ground monitors; over-water estimates would be meaningless
+extrapolation. Water cells render as map background, same as cloud gaps.
 
-**Uncertainty:** Model RMSE ~30–36 µg/m³. The map conveys relative spatial
-patterns (urban vs. rural gradient) more reliably than absolute values.
+**Cloud gaps:** Land cells where no Terra or Aqua overpass returned
+QA-valid AOD are shown as map background (no coloured point). On heavy
+cloud days (monsoon) the map may be mostly empty — this is correct.
+
+**Uncertainty:** Model RMSE ~30-36 ug/m3. The map conveys relative
+spatial patterns (urban vs. rural gradient) more reliably than absolute
+values.
 
 **Validated region:** The model was trained on Delhi and Mumbai. Estimates
 are most reliable within ~500 km of those cities. Areas outside may show

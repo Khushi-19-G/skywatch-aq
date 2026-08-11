@@ -12,6 +12,7 @@ python-dotenv>=1.0
 # Streamlit app
 streamlit>=1.35
 plotly>=5.0
+global-land-mask>=1.0
 
 # NASA satellite data access
 earthaccess>=0.8
