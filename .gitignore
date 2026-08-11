@@ -39,3 +39,7 @@ Thumbs.db
 
 # --- Exception: committed model file (must be LAST so it wins over *.pkl and models/*) ---
 !models/pm25_model.pkl
+# Population data: commit the compact NPZ, not raw country TIFFs
+!data/population/
+data/population/*.tif
+!data/population/population_grid_0p25deg.npz

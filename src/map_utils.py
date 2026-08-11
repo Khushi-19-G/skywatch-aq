@@ -53,6 +53,11 @@ from aod_utils import (
     latlon_to_tile_pixel, tile_id,
     earthaccess_login, find_granule_for_date, download_granule,
 )
+from population_utils import (
+    load_population_grid, compute_exposure, exposure_headline,
+    ensure_population_grid,
+)
+from advisory_utils import build_advisory_context, generate_advisory
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -104,6 +109,9 @@ REGIONS = {
             {"name": "Delhi",   "lat": 28.6139, "lon": 77.2090},
             {"name": "Karachi", "lat": 24.8607, "lon": 67.0011},
         ],
+        # Approximate bounding box for the tile (lat_min, lat_max, lon_min, lon_max)
+        # Used to scope the no-data population estimate
+        "bbox": (20.0, 30.5, 66.0, 82.0),
     },
     "h24v07": {
         "label":      "Mumbai / Central India region",
@@ -114,6 +122,7 @@ REGIONS = {
         "validated_cities": [
             {"name": "Mumbai", "lat": 19.0760, "lon": 72.8777},
         ],
+        "bbox": (10.0, 20.5, 66.0, 82.0),
     },
 }
 
@@ -422,19 +431,34 @@ def _cache_path(region_key: str, date_str: str) -> pathlib.Path:
     return MAP_CACHE_DIR / f"{region_key}_{date_str}.json"
 
 
-def load_cached_map(region_key: str, date_str: str) -> list[dict] | None:
+def load_cached_map(region_key: str, date_str: str) -> tuple[list[dict], dict, dict] | None:
+    """
+    Load cached map data.
+    Returns (cells, exposure, advisory) tuple, or None if no cache.
+    Backward compatible: old caches (plain list) return empty exposure+advisory.
+    """
     p = _cache_path(region_key, date_str)
     if p.exists():
         try:
-            return json.loads(p.read_text(encoding="utf-8"))
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(raw, list):
+                return raw, {"available": False}, {}
+            elif isinstance(raw, dict) and "cells" in raw:
+                return (raw["cells"],
+                        raw.get("exposure", {"available": False}),
+                        raw.get("advisory", {}))
         except Exception:
             pass
     return None
 
 
-def save_cached_map(region_key: str, date_str: str, cells: list[dict]) -> None:
+def save_cached_map(region_key: str, date_str: str,
+                    payload: list[dict] | dict) -> None:
+    """Save map cache.  payload is a dict with cells, exposure, and optional advisory."""
+    if isinstance(payload, list):
+        payload = {"cells": payload, "exposure": {"available": False}, "advisory": {}}
     _cache_path(region_key, date_str).write_text(
-        json.dumps(cells, separators=(",", ":")), encoding="utf-8"
+        json.dumps(payload, separators=(",", ":")), encoding="utf-8"
     )
 
 # ---------------------------------------------------------------------------
@@ -522,8 +546,30 @@ def build_region_map(
     log(f"[map] Prediction complete.  PM2.5 range: "
         f"{min(c['pm25'] for c in cells):.1f} – {max(c['pm25'] for c in cells):.1f} ug/m3")
 
-    # 5. Cache
-    save_cached_map(region_key, date_str, cells)
+    # 5. Exposure computation
+    pop_grid = load_population_grid()
+    if pop_grid is not None:
+        bbox = region.get("bbox")
+        exposure = compute_exposure(cells, pop_grid, region_bbox=bbox)
+        log(f"[map] Exposure computed: {exposure_headline(exposure)}")
+    else:
+        exposure = {"available": False}
+        log("[map] Population grid not available — skipping exposure.")
+
+    # 6. Advisory generation
+    log("[map] Generating health advisory...")
+    try:
+        adv_ctx = build_advisory_context(cells, exposure, region_key, date_str,
+                                         is_forecast=False)
+        advisory = generate_advisory(adv_ctx)
+        log(f"[map] Advisory source: {advisory['source']}")
+    except Exception as e:
+        log(f"[map] Advisory generation failed: {e}")
+        advisory = {}
+
+    # 7. Cache (cells + exposure + advisory)
+    cache_payload = {"cells": cells, "exposure": exposure, "advisory": advisory}
+    save_cached_map(region_key, date_str, cache_payload)
     log(f"[map] Cached to {_cache_path(region_key, date_str).name}")
 
-    return cells
+    return cells, exposure, advisory

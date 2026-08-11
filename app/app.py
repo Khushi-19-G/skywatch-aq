@@ -43,6 +43,18 @@ from map_utils import (
     REGIONS, build_region_map, load_cached_map,
     HEALTH_BANDS as MAP_HEALTH_BANDS,
 )
+from population_utils import (
+    load_population_grid, compute_exposure, exposure_headline,
+    ensure_population_grid,
+    _BAND_SEVERITY as POP_BAND_SEVERITY,
+)
+from forecast_utils import (
+    is_forecast_date, forecast_label,
+    fetch_forecast_weather_point,
+    build_forecast_map, load_forecast_cache,
+    AOD_LOOKBACK_DAYS,
+)
+from advisory_utils import build_advisory_context, generate_advisory
 import plotly.graph_objects as go
 
 # ---------------------------------------------------------------------------
@@ -341,23 +353,6 @@ def predict(bundle: dict, aod: float, date: datetime.date, weather: dict) -> flo
 # Map figure builder
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def build_map_figure(region_key: str, date_str: str) -> go.Figure | None:
-    """
-    Build and return a Plotly figure for the regional map.
-    Cached per (region_key, date_str).
-    Returns None if no cells are available.
-    """
-    # Try cache first (no satellite download needed)
-    cells = load_cached_map(region_key, date_str)
-
-    if cells is None:
-        # Need to build — the caller handles the spinner/progress
-        return None   # signal that build_region_map must be called
-
-    return _cells_to_figure(cells, region_key, date_str)
-
-
 def _cells_to_figure(cells: list[dict], region_key: str, date_str: str) -> go.Figure | None:
     """Convert a list of map cells to a Plotly figure."""
     if not cells:
@@ -450,6 +445,139 @@ def _cells_to_figure(cells: list[dict], region_key: str, date_str: str) -> go.Fi
     return fig
 
 
+# ---------------------------------------------------------------------------
+# Population-exposure UI helper
+# ---------------------------------------------------------------------------
+
+# Band colors for the exposure breakdown bars
+_BAND_COLORS_MAP = {b[2]: b[3] for b in MAP_HEALTH_BANDS}
+
+
+def _render_exposure(exposure: dict, forecast_prefix: str = "") -> None:
+    """
+    Render the population-exposure headline metric row above the map.
+    Shows: headline stat, per-band breakdown table/bars, unknown-coverage line.
+    forecast_prefix — if non-empty, prepended to the headline (e.g. "Tomorrow: ").
+    """
+    if not exposure.get("available"):
+        return
+
+    by_band = exposure.get("by_band", {})
+    no_data = exposure.get("no_data_pop", 0.0)
+
+    # For forecast prefix, drop "today" from the headline stem
+    headline = exposure_headline(exposure, suffix="" if forecast_prefix else "today")
+    if not headline:
+        return
+
+    if forecast_prefix:
+        headline = f"{forecast_prefix}: {headline}"
+
+    # --- Headline ---
+    border_color = "#6366f1" if forecast_prefix else "#f97316"
+    bg_color     = "#eef2ff" if forecast_prefix else "#fff7ed"
+    st.markdown(
+        f'<div style="background:{bg_color};border-left:5px solid {border_color};'
+        f'padding:10px 16px;border-radius:6px;margin-bottom:10px;">'
+        f'<span style="font-size:1.1em;font-weight:600;color:#1f2328;">🏙️ {headline}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # --- Breakdown expander ---
+    with st.expander("Population exposure breakdown by health band", expanded=False):
+        # Table + simple bar representation
+        band_order_display = [b for b in POP_BAND_SEVERITY if b in by_band and by_band[b] >= 0.01]
+
+        if band_order_display:
+            max_pop = max(by_band.get(b, 0.0) for b in band_order_display)
+            rows_html = ""
+            for band in band_order_display:
+                pop_m = by_band.get(band, 0.0)
+                color = _BAND_COLORS_MAP.get(band, "#aaaaaa")
+                bar_w = int(200 * pop_m / max(max_pop, 0.01))
+                rows_html += (
+                    f'<tr>'
+                    f'<td style="padding:4px 10px 4px 0;white-space:nowrap;">'
+                    f'<span style="background:{color};color:white;padding:2px 8px;'
+                    f'border-radius:4px;font-size:0.85em;font-weight:600;">{band}</span></td>'
+                    f'<td style="padding:4px 6px;text-align:right;font-weight:600;'
+                    f'font-variant-numeric:tabular-nums;">{pop_m:.1f} M</td>'
+                    f'<td style="padding:4px 10px;">'
+                    f'<div style="background:{color};height:12px;width:{bar_w}px;'
+                    f'border-radius:2px;opacity:0.85;"></div></td>'
+                    f'</tr>'
+                )
+
+            st.markdown(
+                f'<table style="border-collapse:collapse;font-size:0.9em;">'
+                f'<thead><tr>'
+                f'<th style="text-align:left;padding:4px 10px 4px 0;color:#57606a;">Band</th>'
+                f'<th style="text-align:right;padding:4px 6px;color:#57606a;">Est. population</th>'
+                f'<th style="padding:4px 10px;color:#57606a;"></th>'
+                f'</tr></thead>'
+                f'<tbody>{rows_html}</tbody>'
+                f'</table>',
+                unsafe_allow_html=True,
+            )
+
+        # Unknown coverage line
+        if no_data > 0.05:
+            st.markdown(
+                f'<div style="margin-top:8px;color:#57606a;font-size:0.85em;">'
+                f'☁️ <strong>No estimate available</strong> for areas holding an estimated '
+                f'<strong>{no_data:.1f} M people</strong> (AOD gap / cloud cover — '
+                f'their air quality could not be assessed).</div>',
+                unsafe_allow_html=True,
+            )
+
+        # Method note
+        method_note = (
+            "**Population source:** WorldPop 2020 country mosaics aggregated to 0.25° (~28 km) "
+            "grid cells (CC BY 4.0). **Method:** population assigned to the nearest grid cell "
+            "at each estimated air-quality band; estimates carry ~30 µg/m³ model uncertainty. "
+            "Cloud-covered cells are excluded from band totals and reported separately."
+        )
+        if forecast_prefix:
+            method_note += (
+                f" **Forecast note:** AOD values are persisted from the most recent satellite "
+                f"pass (up to {AOD_LOOKBACK_DAYS} days old); forecast weather from Open-Meteo. "
+                f"Forecast uncertainty is substantially higher than same-day estimates."
+            )
+        st.caption(method_note)
+
+
+def _render_advisory(advisory: dict, is_forecast: bool = False) -> None:
+    """
+    Render the Granite (or fallback) health advisory in a styled box.
+    advisory = {"text": str, "source": str}  — silently no-ops if empty.
+    """
+    if not advisory or not advisory.get("text"):
+        return
+
+    text   = advisory["text"]
+    source = advisory.get("source", "rule-based")
+    is_granite = "Granite" in source
+
+    border = "#3b82d4" if is_granite else "#e5e7eb"
+    bg     = "#eff6ff" if is_granite else "#f7f8fa"
+    label  = (
+        "Advisory generated by **IBM Granite** (watsonx.ai)"
+        if is_granite else
+        "Advisory (rule-based)"
+    )
+
+    st.markdown(
+        f'<div style="background:{bg};border-left:4px solid {border};'
+        f'padding:12px 16px;border-radius:6px;margin-top:10px;margin-bottom:4px;">'
+        f'<div style="font-size:0.82em;color:#57606a;margin-bottom:6px;">'
+        f'{"🤖 " if is_granite else "📋 "}{label}</div>'
+        f'<div style="color:#1f2328;line-height:1.6;">{text}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
 _PLOTLY_CONFIG = {
     "scrollZoom":      True,   # mouse-wheel / trackpad zoom
     "displayModeBar":  True,   # always show the zoom/pan toolbar
@@ -489,7 +617,8 @@ with tab_map:
     st.caption(
         "The model is applied to every ~22 km satellite pixel across the selected "
         "region. Grey gaps are cloud-covered cells with no satellite view — never "
-        "interpolated. Resolution ~22 km; uncertainty ~30 ug/m3 RMSE."
+        "interpolated. Resolution ~22 km; uncertainty ~30 ug/m3 RMSE. "
+        "Select tomorrow or day-after for a **forecast** map (persistence AOD + forecast weather)."
     )
 
     map_col1, map_col2 = st.columns([1, 3])
@@ -500,16 +629,28 @@ with tab_map:
         )
         map_region_key = region_options[map_region_label]
 
-        yesterday_map = datetime.date.today() - datetime.timedelta(days=1)
+        today_map     = datetime.date.today()
+        yesterday_map = today_map - datetime.timedelta(days=1)
+        max_map_date  = today_map + datetime.timedelta(days=2)
         map_date = st.date_input(
             "Date",
             value=yesterday_map,
             min_value=datetime.date(2023, 1, 1),
-            max_value=yesterday_map,
+            max_value=max_map_date,
             key="map_date",
-            help="First render downloads a ~15 MB satellite file; subsequent renders use cache.",
+            help=(
+                "Past dates: archive satellite + weather.  "
+                "Today or future: FORECAST mode — persisted AOD + forecast weather. "
+                "First build downloads ~15 MB of satellite data."
+            ),
         )
-        map_date_str = map_date.isoformat()
+        map_date_str  = map_date.isoformat()
+        map_is_forecast = is_forecast_date(map_date_str)
+
+        if map_is_forecast:
+            fc_lbl = forecast_label(map_date_str)
+            st.info(f"🔮 **FORECAST mode** — {fc_lbl}  \nPersisted AOD + Open-Meteo forecast weather. Higher uncertainty.", icon="🔮")
+
         run_map = st.button("Build map", type="primary",
                             use_container_width=True, key="run_map")
 
@@ -537,42 +678,112 @@ systematic bias.
 
 **Temporal:** Each map is a snapshot for one calendar day. The granule
 represents a single Terra+Aqua overpass (~10:30 AM local time).
+
+**Population exposure:** WorldPop 2020 country mosaics (CC BY 4.0)
+aggregated to 0.25° (~28 km) grid cells. Exposure = population in cells
+at each estimated band. Estimates carry ~30 µg/m³ model uncertainty;
+cloud-covered areas are reported separately as "no estimate available."
+
+**Forecast mode (future dates):** AOD is persisted from the most recent
+available satellite pass (up to 5 days). Forecast weather is from
+Open-Meteo. Forecast uncertainty is substantially higher than same-day
+estimates — treat as directional guidance only. Forecast cache is valid
+for today only and is rebuilt if stale.
             """)
 
     with map_col2:
+        # ---- helper: render forecast badge ----
+        def _show_forecast_badge(aod_date: str | None) -> None:
+            aod_note = f" (AOD from {aod_date})" if aod_date else ""
+            st.markdown(
+                f'<div style="display:inline-block;background:#6366f1;color:white;'
+                f'padding:3px 12px;border-radius:12px;font-size:0.82em;font-weight:600;'
+                f'margin-bottom:8px;">🔮 FORECAST{aod_note}</div>'
+                f'<div style="color:#57606a;font-size:0.82em;margin-bottom:8px;">'
+                f'Forecast uses latest available satellite AOD (persistence, up to '
+                f'{AOD_LOOKBACK_DAYS} days old) + Open-Meteo forecast weather — '
+                f'uncertainty is substantially higher than same-day estimates.</div>',
+                unsafe_allow_html=True,
+            )
+
         if not run_map:
-            # Check cache first — render instantly if available
-            cached = load_cached_map(map_region_key, map_date_str)
-            if cached is not None:
-                fig = _cells_to_figure(cached, map_region_key, map_date_str)
-                if fig:
-                    n_cells = len(cached)
-                    st.success(
-                        f"Showing cached map: {n_cells:,} valid cells for {map_date_str}.",
-                        icon="🗺️",
-                    )
-                    st.plotly_chart(fig, use_container_width=True,
-                                    config=_PLOTLY_CONFIG)
+            if map_is_forecast:
+                # For forecast: check today's forecast cache
+                fcache = load_forecast_cache(map_region_key, map_date_str)
+                if fcache is not None:
+                    cached_cells, cached_exposure, cached_advisory = fcache
+                    fig = _cells_to_figure(cached_cells, map_region_key, map_date_str)
+                    if fig:
+                        fc_lbl = forecast_label(map_date_str)
+                        st.success(
+                            f"Showing cached forecast: {len(cached_cells):,} cells for {map_date_str}.",
+                            icon="🔮",
+                        )
+                        _show_forecast_badge(None)
+                        _render_exposure(cached_exposure, forecast_prefix=fc_lbl)
+                        _render_advisory(cached_advisory, is_forecast=True)
+                        st.plotly_chart(fig, use_container_width=True,
+                                        config=_PLOTLY_CONFIG)
+                    else:
+                        st.info("Forecast data cached but empty — click **Build map**.", icon="🔮")
                 else:
+                    fc_lbl = forecast_label(map_date_str)
                     st.info(
-                        "No satellite data available for this date "
-                        "(complete cloud cover or data gap).",
-                        icon="☁️",
+                        f"🔮 **{fc_lbl} forecast** — click **Build map** to generate.  \n"
+                        f"Uses persisted satellite AOD (up to {AOD_LOOKBACK_DAYS} days old) "
+                        f"+ Open-Meteo forecast weather.",
+                        icon="🔮",
                     )
             else:
-                st.info(
-                    "Select a region and date, then click **Build map**.  \n"
-                    "First render downloads ~15 MB of satellite data and takes ~60 s. "
-                    "Subsequent renders for the same date are instant.",
-                    icon="🗺️",
-                )
+                # Past date — check archive cache
+                cached_result = load_cached_map(map_region_key, map_date_str)
+                if cached_result is not None:
+                    cached_cells, cached_exposure, cached_advisory = cached_result
+                    fig = _cells_to_figure(cached_cells, map_region_key, map_date_str)
+                    if fig:
+                        n_cells = len(cached_cells)
+                        st.success(
+                            f"Showing cached map: {n_cells:,} valid cells for {map_date_str}.",
+                            icon="🗺️",
+                        )
+                        # Re-compute exposure if legacy cache lacks it
+                        if not cached_exposure.get("available"):
+                            pop_grid = load_population_grid()
+                            if pop_grid is not None:
+                                bbox = REGIONS[map_region_key].get("bbox")
+                                cached_exposure = compute_exposure(
+                                    cached_cells, pop_grid, region_bbox=bbox
+                                )
+                        _render_exposure(cached_exposure)
+                        # Generate advisory on-the-fly if not cached yet
+                        if not cached_advisory.get("text"):
+                            adv_ctx = build_advisory_context(
+                                cached_cells, cached_exposure, map_region_key, map_date_str
+                            )
+                            cached_advisory = generate_advisory(adv_ctx)
+                        _render_advisory(cached_advisory)
+                        st.plotly_chart(fig, use_container_width=True,
+                                        config=_PLOTLY_CONFIG)
+                    else:
+                        st.info(
+                            "No satellite data available for this date "
+                            "(complete cloud cover or data gap).",
+                            icon="☁️",
+                        )
+                else:
+                    st.info(
+                        "Select a region and date, then click **Build map**.  \n"
+                        "First render downloads ~15 MB of satellite data and takes ~60 s. "
+                        "Subsequent renders for the same date are instant.",
+                        icon="🗺️",
+                    )
         else:
             # Build map with live progress
             progress_box = st.empty()
             progress_msgs: list[str] = []
 
             def _progress(msg: str) -> None:
-                progress_msgs.append(msg.replace("[map] ", ""))
+                progress_msgs.append(msg.replace("[map] ", "").replace("[forecast] ", ""))
                 progress_box.info(
                     "\n\n".join(f"- {m}" for m in progress_msgs[-5:]),
                     icon="🛰️",
@@ -580,29 +791,79 @@ represents a single Terra+Aqua overpass (~10:30 AM local time).
 
             bundle = load_model()
 
-            with st.spinner("Building regional map — downloading satellite granule..."):
-                cells = load_cached_map(map_region_key, map_date_str)
-                if cells is None:
-                    cells = build_region_map(
-                        map_region_key, map_date_str, bundle, progress_cb=_progress
+            if map_is_forecast:
+                # --- FORECAST PATH ---
+                with st.spinner(f"Building forecast map for {map_date_str}..."):
+                    # Check today's cache first
+                    fcache = load_forecast_cache(map_region_key, map_date_str)
+                    if fcache is not None:
+                        cells, exposure, advisory = fcache
+                        aod_date_used = None
+                    else:
+                        result_fc = build_forecast_map(
+                            map_region_key, map_date_str, bundle, progress_cb=_progress
+                        )
+                        cells, exposure, aod_date_used, advisory = result_fc
+
+                progress_box.empty()
+
+                if not cells:
+                    st.warning(
+                        "No persisted AOD found within the last 5 days — cannot build forecast. "
+                        "Try a different date or check satellite availability.",
+                        icon="🔮",
                     )
-
-            progress_box.empty()
-
-            if not cells:
-                st.warning(
-                    "No valid satellite data for this region and date. "
-                    "The entire tile may be under cloud cover. Try a different date.",
-                    icon="☁️",
-                )
+                else:
+                    fc_lbl = forecast_label(map_date_str)
+                    fig = _cells_to_figure(cells, map_region_key, map_date_str)
+                    st.success(
+                        f"Forecast map: {len(cells):,} cells with persisted AOD for {map_date_str}.",
+                        icon="🔮",
+                    )
+                    _show_forecast_badge(aod_date_used)
+                    _render_exposure(exposure, forecast_prefix=fc_lbl)
+                    _render_advisory(advisory, is_forecast=True)
+                    st.plotly_chart(fig, use_container_width=True,
+                                    config=_PLOTLY_CONFIG)
             else:
-                fig = _cells_to_figure(cells, map_region_key, map_date_str)
-                st.success(
-                    f"Map built: {len(cells):,} valid cells (of 2,500 possible).",
-                    icon="🗺️",
-                )
-                st.plotly_chart(fig, use_container_width=True,
-                                config=_PLOTLY_CONFIG)
+                # --- ARCHIVE PATH ---
+                with st.spinner("Building regional map — downloading satellite granule..."):
+                    cached_result = load_cached_map(map_region_key, map_date_str)
+                    if cached_result is not None:
+                        cells, exposure, advisory = cached_result
+                        # Re-compute exposure if legacy cache lacks it
+                        if not exposure.get("available"):
+                            pop_grid = load_population_grid()
+                            if pop_grid is not None:
+                                bbox = REGIONS[map_region_key].get("bbox")
+                                exposure = compute_exposure(cells, pop_grid, region_bbox=bbox)
+                    else:
+                        result = build_region_map(
+                            map_region_key, map_date_str, bundle, progress_cb=_progress
+                        )
+                        if result:
+                            cells, exposure, advisory = result
+                        else:
+                            cells, exposure, advisory = [], {"available": False}, {}
+
+                progress_box.empty()
+
+                if not cells:
+                    st.warning(
+                        "No valid satellite data for this region and date. "
+                        "The entire tile may be under cloud cover. Try a different date.",
+                        icon="☁️",
+                    )
+                else:
+                    fig = _cells_to_figure(cells, map_region_key, map_date_str)
+                    st.success(
+                        f"Map built: {len(cells):,} valid cells (of 2,500 possible).",
+                        icon="🗺️",
+                    )
+                    _render_exposure(exposure)
+                    _render_advisory(advisory)
+                    st.plotly_chart(fig, use_container_width=True,
+                                    config=_PLOTLY_CONFIG)
 
 # ============================================================================
 # TAB 1 — SINGLE-CITY ESTIMATE
@@ -626,13 +887,24 @@ with tab_city:
             st.caption(f"Lat {lat:.4f}  ·  Lon {lon:.4f}")
 
         yesterday = datetime.date.today() - datetime.timedelta(days=1)
+        max_city_date = datetime.date.today() + datetime.timedelta(days=2)
         selected_date = st.date_input(
             "Date",
             value=yesterday,
             min_value=datetime.date(2023, 1, 1),
-            max_value=yesterday,
-            help="Open-Meteo archive is available up to yesterday.",
+            max_value=max_city_date,
+            help=(
+                "Archive dates (up to yesterday): satellite AOD + historical weather.  "
+                "Today / tomorrow / day-after: FORECAST mode — persisted AOD + forecast weather."
+            ),
         )
+        city_is_forecast = is_forecast_date(selected_date.isoformat())
+        if city_is_forecast:
+            st.info(
+                f"🔮 **FORECAST** — {forecast_label(selected_date.isoformat())}  \n"
+                "Uses most recent satellite AOD + Open-Meteo forecast weather.",
+                icon="🔮",
+            )
 
         st.divider()
         run = st.button("Estimate PM2.5", type="primary", use_container_width=True)
@@ -671,6 +943,14 @@ cloud gaps are shown honestly as background, and model uncertainty (~30
 ug/m3 RMSE) is the same as the single-city mode. Use the map to understand
 spatial patterns, not precise values.
 
+**Health advisory layer:** For each regional map, a plain-language public
+health advisory is generated by **IBM Granite** (`ibm/granite-3-8b-instruct`)
+via watsonx.ai — summarising conditions, at-risk groups, and 2–3 concrete
+recommendations in 3–5 sentences. When watsonx credentials are not
+configured, a rule-based template produces an equivalent advisory. All
+advisories contain the phrase "estimates, not measurements" and are clearly
+labelled with their source.
+
 **Model performance:**
 | Metric | Delhi+Mumbai CV | Karachi zero-shot |
 |--------|----------------|-------------------|
@@ -687,28 +967,35 @@ spatial patterns, not precise values.
     # ---------------------------------------------------------------------------
     date_str = selected_date.isoformat()
 
-    # --- 1. Auto-fetch satellite AOD ---
+    # --- 1. Satellite AOD (persistence for forecast; archive search for past) ---
     aod_val     = aod_default     # fallback value
     aod_source  = "default"       # "satellite" | "manual" | "default"
     aod_date    = None
 
     aod_status = st.empty()
-    aod_status.info("🛰️ Searching NASA satellite archive for AOD...", icon="🛰️")
 
-    auto_aod, auto_date = fetch_aod_auto(lat, lon, date_str)
+    if city_is_forecast:
+        # Forecast: search for most recent past granule (lookback from yesterday)
+        lookback_anchor = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+        aod_status.info("🛰️ Searching for most recent satellite AOD (persistence)...", icon="🛰️")
+        auto_aod, auto_date = fetch_aod_auto(lat, lon, lookback_anchor)
+    else:
+        aod_status.info("🛰️ Searching NASA satellite archive for AOD...", icon="🛰️")
+        auto_aod, auto_date = fetch_aod_auto(lat, lon, date_str)
 
     if auto_aod is not None:
         aod_val    = auto_aod
         aod_date   = auto_date
         aod_source = "satellite"
+        persistence_note = f" · persistence from {aod_date}" if city_is_forecast else ""
         aod_status.success(
             f"**Satellite AOD: {aod_val:.3f}**  (from {aod_date} pass, "
-            f"MODIS MAIAC MCD19A2, QA-filtered)",
+            f"MODIS MAIAC MCD19A2, QA-filtered{persistence_note})",
             icon="🛰️",
         )
     else:
         aod_status.warning(
-            "No valid satellite AOD found within 7 days of the selected date "
+            "No valid satellite AOD found within 7 days "
             "(cloud cover or data gap). Using city historical average as fallback.",
             icon="☁️",
         )
@@ -732,9 +1019,12 @@ spatial patterns, not precise values.
             aod_val    = manual_aod
             aod_source = "manual"
 
-    # --- 2. Weather ---
-    with st.spinner(f"Fetching weather for {city_name} on {date_str}..."):
-        weather = fetch_weather(lat, lon, date_str)
+    # --- 2. Weather (forecast API for future dates, archive for past) ---
+    with st.spinner(f"Fetching {'forecast' if city_is_forecast else 'archive'} weather for {city_name} on {date_str}..."):
+        if city_is_forecast:
+            weather = fetch_forecast_weather_point(lat, lon, date_str)
+        else:
+            weather = fetch_weather(lat, lon, date_str)
     weather_ok = weather is not None and any(v is not None for v in weather.values())
 
     # --- 3. Predict ---
@@ -749,7 +1039,21 @@ spatial patterns, not precise values.
     # ---------------------------------------------------------------------------
     # Results header
     # ---------------------------------------------------------------------------
-    st.subheader(f"Results — {city_name}, {date_str}")
+    fc_result_lbl = forecast_label(date_str) if city_is_forecast else ""
+    title_suffix  = f" — {fc_result_lbl} Forecast" if city_is_forecast else ""
+    st.subheader(f"Results — {city_name}, {date_str}{title_suffix}")
+
+    # Forecast badge
+    if city_is_forecast:
+        st.markdown(
+            f'<div style="display:inline-block;background:#6366f1;color:white;'
+            f'padding:3px 12px;border-radius:12px;font-size:0.82em;font-weight:600;'
+            f'margin-bottom:6px;">🔮 FORECAST — {fc_result_lbl}</div>'
+            f'<div style="color:#57606a;font-size:0.82em;margin-bottom:8px;">'
+            f'AOD persisted from most recent satellite pass · forecast weather · '
+            f'higher uncertainty than archive estimates</div>',
+            unsafe_allow_html=True,
+        )
 
     # Region confidence badge
     is_validated, conf_text = region_confidence(lat, lon)
@@ -783,12 +1087,18 @@ spatial patterns, not precise values.
     )
 
     # ---------------------------------------------------------------------------
-    # REALITY CHECK PANEL  (Part 2)
+    # REALITY CHECK PANEL  (Part 2) — skipped for forecast dates
     # ---------------------------------------------------------------------------
     st.divider()
     st.subheader("Reality check")
 
-    if openaq_coords is not None:
+    if city_is_forecast:
+        st.info(
+            "Ground-monitor data is not available for future dates — "
+            "this is a forecast estimate only.  Check back after the date passes.",
+            icon="🔮",
+        )
+    elif openaq_coords is not None:
         with st.spinner("Fetching ground monitor data from OpenAQ..."):
             ground_pm25 = fetch_ground_truth(openaq_coords, date_str)
 
@@ -829,7 +1139,8 @@ spatial patterns, not precise values.
     # ---------------------------------------------------------------------------
     st.divider()
     if weather_ok:
-        st.subheader("Weather inputs (Open-Meteo)")
+        wx_lbl = "Forecast weather (Open-Meteo)" if city_is_forecast else "Weather inputs (Open-Meteo)"
+        st.subheader(wx_lbl)
         W_LABELS = {
             "temperature_2m_mean":        ("Temperature",      "°C"),
             "relative_humidity_2m_mean":  ("Relative Humidity","%"),
@@ -850,7 +1161,11 @@ spatial patterns, not precise values.
     # ---------------------------------------------------------------------------
     with st.expander("Inputs summary"):
         aod_src_label = {
-            "satellite": f"Satellite auto-fetch (pass date: {aod_date})",
+            "satellite": (
+                f"Satellite persistence (AOD date: {aod_date}, forecast mode)"
+                if city_is_forecast else
+                f"Satellite auto-fetch (pass date: {aod_date})"
+            ),
             "manual":    "Manual override",
             "default":   "City historical average (fallback)",
         }[aod_source]
