@@ -444,8 +444,17 @@ def _cells_to_figure(cells: list[dict], region_key: str, date_str: str) -> go.Fi
         title=dict(text=title_text, font=dict(size=13)),
         margin=dict(l=0, r=0, t=70, b=0),
         height=580,
+        dragmode="pan",          # default interaction: pan (not select/zoom-box)
     )
     return fig
+
+
+_PLOTLY_CONFIG = {
+    "scrollZoom":      True,   # mouse-wheel / trackpad zoom
+    "displayModeBar":  True,   # always show the zoom/pan toolbar
+    "modeBarButtonsToRemove": ["select2d", "lasso2d"],  # remove irrelevant tools
+    "displaylogo":     False,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -535,7 +544,8 @@ represents a single Terra+Aqua overpass (~10:30 AM local time).
                         f"Showing cached map: {n_cells:,} valid cells for {map_date_str}.",
                         icon="🗺️",
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True,
+                                    config=_PLOTLY_CONFIG)
                 else:
                     st.info(
                         "No satellite data available for this date "
@@ -584,7 +594,8 @@ represents a single Terra+Aqua overpass (~10:30 AM local time).
                     f"Map built: {len(cells):,} valid cells (of 2,500 possible).",
                     icon="🗺️",
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True,
+                                config=_PLOTLY_CONFIG)
 
 # ============================================================================
 # TAB 1 — SINGLE-CITY ESTIMATE
