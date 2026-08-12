@@ -40,6 +40,9 @@ try:
 except Exception:
     pass
 
+st.caption(f"debug: ED_user={bool(os.environ.get('EARTHDATA_USERNAME'))} ED_pass={bool(os.environ.get('EARTHDATA_PASSWORD'))}")
+
+
 # Add src/ to path for aod_utils + map_utils
 import sys
 sys.path.insert(0, str(_REPO_ROOT / "src"))
