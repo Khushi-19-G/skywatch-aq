@@ -21,6 +21,13 @@ import joblib
 import streamlit as st
 from dotenv import load_dotenv
 
+
+try:
+    for _k in ("EARTHDATA_USERNAME", "EARTHDATA_PASSWORD", "OPENAQ_API_KEY", "HF_TOKEN"):
+        if _k in st.secrets and not os.environ.get(_k):
+            os.environ[_k] = st.secrets[_k]
+except Exception:
+    pass
 # ---------------------------------------------------------------------------
 # Bootstrap: load .env and push creds into os.environ so earthaccess finds them
 # ---------------------------------------------------------------------------
