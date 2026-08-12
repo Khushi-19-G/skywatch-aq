@@ -31,6 +31,15 @@ for _k in ("EARTHDATA_USERNAME", "EARTHDATA_PASSWORD"):
     if _v:
         os.environ[_k] = _v
 
+# Bridge Streamlit Cloud secrets into env vars (no-op locally)
+
+try:
+    for _k in ("EARTHDATA_USERNAME", "EARTHDATA_PASSWORD", "OPENAQ_API_KEY", "HF_TOKEN"):
+        if _k in st.secrets and not os.environ.get(_k):
+            os.environ[_k] = st.secrets[_k]
+except Exception:
+    pass
+
 # Add src/ to path for aod_utils + map_utils
 import sys
 sys.path.insert(0, str(_REPO_ROOT / "src"))
