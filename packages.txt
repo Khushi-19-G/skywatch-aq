@@ -1,4 +1,2 @@
-# System packages installed by Streamlit Cloud (apt-get) before pip install.
-# Required for pyhdf to build/link against HDF4 on Ubuntu.
 libhdf4-dev
 libhdf4-alt-dev
