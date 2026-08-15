@@ -11,10 +11,28 @@ Public API
   earthaccess_login()             -> None  (idempotent; reads .env)
   find_granule_for_date(tile, date_str, lookback_days)
       -> (granule_object, actual_date_str) | (None, None)
-  download_granule(granule, cache_dir, retries) -> Path | None
+  download_granule(granule, cache_dir, retries) -> Path
   extract_aod_at_point(hdf_path, lat, lon) -> float | None
       QA-filtered mean AOD over all valid Terra+Aqua orbits at the
       nearest pixel to (lat, lon).  Returns None if no valid data.
+
+HDF reader notes
+----------------
+  MCD19A2 is HDF4/HDF-EOS.  We open it with two backends in priority order:
+
+  1. netCDF4  — works on Windows (local) where the wheel is built with HDF4.
+               Raises "[Errno -128] ... feature not turned on" on the Linux pip
+               wheel used by Streamlit Cloud.
+
+  2. pyhdf   — pure HDF4 SD API; works everywhere as long as libhdf4 is
+               available (packages.txt installs it on Streamlit Cloud).
+               Returns raw int16; we apply scale_factor + add_offset from
+               the SDS attributes and build an equivalent masked array.
+
+  _open_hdf4(path) encapsulates this try/fallback and returns identical
+  (aod_arr, qa_arr) shapes/dtypes to both callers:
+    aod_arr: np.ma.MaskedArray float64 (n_orbits, 1200, 1200)
+    qa_arr:  np.ndarray uint16         (n_orbits, 1200, 1200)
 """
 
 import math
@@ -38,6 +56,84 @@ PIX_M        = TILE_M / PIX_PER_TILE   # ~926.6 m
 
 # AOD_QA cloud-mask bits 0-2: keep 001 (Clear) and 011 (Possibly cloudy)
 KEEP_CLOUD_STATES = {0b001, 0b011}
+
+
+# ---------------------------------------------------------------------------
+# HDF4 reader — nc4 primary, pyhdf fallback
+# ---------------------------------------------------------------------------
+
+def _open_hdf4(
+    hdf_path: pathlib.Path,
+) -> tuple["np.ma.MaskedArray", "np.ndarray"]:
+    """
+    Open an MCD19A2 HDF4 granule and return:
+      aod_arr : float64 masked array  (n_orbits, 1200, 1200)  — scaled, fill masked
+      qa_arr  : uint16  ndarray       (n_orbits, 1200, 1200)  — raw QA bits
+
+    Tries netCDF4 first (works on Windows / any build with HDF4 support).
+    Falls back to pyhdf if netCDF4 raises the "feature not turned on" error
+    that occurs on the Streamlit Cloud Linux pip wheel.
+
+    Raises RuntimeError for any other open failure so callers get a clear message.
+    """
+    path_str = str(hdf_path)
+
+    # ---- attempt 1: netCDF4 ----
+    try:
+        ds = nc4.Dataset(path_str)
+        try:
+            aod_arr = ds.variables["Optical_Depth_055"][:]   # masked float64
+            qa_arr  = ds.variables["AOD_QA"][:].data         # uint16
+        finally:
+            ds.close()
+        return aod_arr, qa_arr
+    except Exception as nc4_err:
+        # Only fall through if this looks like the "HDF4 not compiled in" error;
+        # re-raise anything else (file-not-found, corrupt file, etc.).
+        err_str = str(nc4_err).lower()
+        if "feature" not in err_str and "not turned on" not in err_str and "errno -128" not in err_str:
+            raise RuntimeError(
+                f"Failed to open HDF granule {hdf_path.name}: {nc4_err}"
+            ) from nc4_err
+        # Fall through to pyhdf
+
+    # ---- attempt 2: pyhdf ----
+    try:
+        from pyhdf.SD import SD as _SD, SDC as _SDC  # type: ignore
+    except ImportError as imp_err:
+        raise RuntimeError(
+            f"netCDF4 cannot open HDF4 on this platform ({nc4_err}) and pyhdf "  # noqa: F821
+            f"is not installed.  Add pyhdf to requirements.txt and libhdf4-dev "
+            f"to packages.txt: {imp_err}"
+        ) from imp_err
+
+    try:
+        f = _SD(path_str, _SDC.READ)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to open HDF granule {hdf_path.name} via pyhdf: {e}"
+        ) from e
+
+    try:
+        aod_sds = f.select("Optical_Depth_055")
+        qa_sds  = f.select("AOD_QA")
+
+        aod_raw = np.array(aod_sds[:], dtype=np.float64)   # (n_orbits, 1200, 1200)
+        qa_arr  = np.array(qa_sds[:],  dtype=np.uint16)
+
+        attrs      = aod_sds.attributes()
+        scale      = float(attrs.get("scale_factor", 1.0))
+        offset     = float(attrs.get("add_offset",   0.0))
+        fill_val   = int(  attrs.get("_FillValue",   -28672))
+
+        # Apply scale; mask fill values to match netCDF4 masked-array output
+        fill_mask = (aod_raw == fill_val)
+        aod_phys  = np.where(fill_mask, np.nan, aod_raw * scale + offset)
+        aod_arr   = np.ma.masked_invalid(aod_phys)
+    finally:
+        f.end()
+
+    return aod_arr, qa_arr
 
 
 class TilePixel(NamedTuple):
@@ -251,31 +347,25 @@ def extract_aod_at_point(
         return None
 
     try:
-        ds = nc4.Dataset(str(hdf_path))
-    except Exception:
+        aod_arr, qa_arr = _open_hdf4(hdf_path)
+    except RuntimeError:
         return None
 
     valid_aods: list[float] = []
-    try:
-        aod_arr = ds.variables["Optical_Depth_055"][:]        # masked float64
-        qa_arr  = ds.variables["AOD_QA"][:].data              # uint16 raw
-
-        n_orbits = aod_arr.shape[0]
-        for orbit_idx in range(n_orbits):
-            val = aod_arr[orbit_idx, tp.row, tp.col]
-            if np.ma.is_masked(val):
-                continue
-            aod_f = float(val)
-            if aod_f < -0.05:
-                continue
-            qa_val = int(qa_arr[orbit_idx, tp.row, tp.col])
-            if qa_val == 0:
-                continue
-            if (qa_val & 0b111) not in KEEP_CLOUD_STATES:
-                continue
-            valid_aods.append(aod_f)
-    finally:
-        ds.close()
+    n_orbits = aod_arr.shape[0]
+    for orbit_idx in range(n_orbits):
+        val = aod_arr[orbit_idx, tp.row, tp.col]
+        if np.ma.is_masked(val):
+            continue
+        aod_f = float(val)
+        if aod_f < -0.05:
+            continue
+        qa_val = int(qa_arr[orbit_idx, tp.row, tp.col])
+        if qa_val == 0:
+            continue
+        if (qa_val & 0b111) not in KEEP_CLOUD_STATES:
+            continue
+        valid_aods.append(aod_f)
 
     if not valid_aods:
         return None

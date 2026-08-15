@@ -18,6 +18,9 @@ global-land-mask==1.0.0
 # 0.18.0 is the version used for development and testing.
 earthaccess==0.18.0
 netCDF4==1.7.4
+# pyhdf: HDF4/SD fallback reader for MCD19A2 when the netCDF4 Linux wheel is built
+# without HDF4 support (Streamlit Cloud).  Requires libhdf4-dev (see packages.txt).
+pyhdf==0.11.7
 
 # Geospatial / array I/O
 xarray==2026.7.0

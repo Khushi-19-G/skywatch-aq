@@ -46,7 +46,6 @@ logger = logging.getLogger(__name__)
 
 import requests
 import numpy as np
-import netCDF4 as nc4
 from global_land_mask import globe as _globe
 
 # ---------------------------------------------------------------------------
@@ -58,6 +57,7 @@ from aod_utils import (
     KEEP_CLOUD_STATES,
     latlon_to_tile_pixel, tile_id,
     earthaccess_login, find_granule_for_date, download_granule,
+    _open_hdf4,
 )
 from population_utils import (
     load_population_grid, compute_exposure, exposure_headline,
@@ -188,54 +188,46 @@ def extract_aod_grid(
     Returns list of dicts:
       {row, col, lat, lon, aod}  — only pixels with at least one valid orbit.
     """
-    try:
-        ds = nc4.Dataset(str(hdf_path))
-    except Exception as e:
-        raise RuntimeError(f"Failed to open HDF granule {hdf_path.name}: {e}") from e
+    # _open_hdf4 tries netCDF4 then pyhdf; raises RuntimeError on hard failure
+    aod_arr, qa_arr = _open_hdf4(hdf_path)
+    n_orbits = aod_arr.shape[0]
 
     cells: list[dict] = []
-    try:
-        aod_arr = ds.variables["Optical_Depth_055"][:]    # (2,1200,1200) masked float64
-        qa_arr  = ds.variables["AOD_QA"][:].data          # (2,1200,1200) uint16 raw
-        n_orbits = aod_arr.shape[0]
+    row_indices = range(0, PIX_PER_TILE, step)
+    col_indices = range(0, PIX_PER_TILE, step)
 
-        row_indices = range(0, PIX_PER_TILE, step)
-        col_indices = range(0, PIX_PER_TILE, step)
+    for row in row_indices:
+        for col in col_indices:
+            lat, lon = pixel_to_latlon(h_tile, v_tile, row, col)
+            if not _is_land(lat, lon):
+                continue   # skip ocean / sea cells
 
-        for row in row_indices:
-            for col in col_indices:
-                lat, lon = pixel_to_latlon(h_tile, v_tile, row, col)
-                if not _is_land(lat, lon):
-                    continue   # skip ocean / sea cells
+            valid_aods: list[float] = []
+            for orbit in range(n_orbits):
+                val = aod_arr[orbit, row, col]
+                if np.ma.is_masked(val):
+                    continue
+                aod_f = float(val)
+                if aod_f < -0.05:
+                    continue
+                qa_val = int(qa_arr[orbit, row, col])
+                if qa_val == 0:
+                    continue
+                if (qa_val & 0b111) not in KEEP_CLOUD_STATES:
+                    continue
+                valid_aods.append(aod_f)
 
-                valid_aods: list[float] = []
-                for orbit in range(n_orbits):
-                    val = aod_arr[orbit, row, col]
-                    if np.ma.is_masked(val):
-                        continue
-                    aod_f = float(val)
-                    if aod_f < -0.05:
-                        continue
-                    qa_val = int(qa_arr[orbit, row, col])
-                    if qa_val == 0:
-                        continue
-                    if (qa_val & 0b111) not in KEEP_CLOUD_STATES:
-                        continue
-                    valid_aods.append(aod_f)
+            if not valid_aods:
+                continue   # cloud / no data — skip cell
 
-                if not valid_aods:
-                    continue   # cloud / no data — skip cell
-
-                mean_aod = round(sum(valid_aods) / len(valid_aods), 4)
-                cells.append({
-                    "row": row,
-                    "col": col,
-                    "lat": round(lat, 4),
-                    "lon": round(lon, 4),
-                    "aod": mean_aod,
-                })
-    finally:
-        ds.close()
+            mean_aod = round(sum(valid_aods) / len(valid_aods), 4)
+            cells.append({
+                "row": row,
+                "col": col,
+                "lat": round(lat, 4),
+                "lon": round(lon, 4),
+                "aod": mean_aod,
+            })
 
     return cells
 
