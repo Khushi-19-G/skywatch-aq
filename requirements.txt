@@ -1,24 +1,25 @@
 # Core data science
-pandas>=2.0
-numpy>=1.26
-scikit-learn>=1.3
-matplotlib>=3.7
-joblib>=1.3
+pandas==3.0.5
+numpy==2.4.3
+scikit-learn==1.8.0
+matplotlib==3.11.1
+joblib==1.5.3
 
 # HTTP / credentials
-requests>=2.31
-python-dotenv>=1.0
+requests==2.32.5
+python-dotenv==1.2.2
 
 # Streamlit app
-streamlit>=1.35
-plotly>=5.0
-global-land-mask>=1.0
+streamlit==1.61.1
+plotly==6.9.0
+global-land-mask==1.0.0
 
-# NASA satellite data access
-earthaccess>=0.8
-netCDF4>=1.6
+# NASA satellite data access — PINNED: CMR search behavior changed across versions;
+# 0.18.0 is the version used for development and testing.
+earthaccess==0.18.0
+netCDF4==1.7.4
 
 # Geospatial / array I/O
-xarray>=2023.1
-scipy>=1.11
-rasterio>=1.3
+xarray==2026.7.0
+scipy==1.17.1
+rasterio==1.5.1

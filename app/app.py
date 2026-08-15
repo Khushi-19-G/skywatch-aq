@@ -202,29 +202,29 @@ def fetch_aod_auto(lat: float, lon: float, date_str: str) -> tuple[float | None,
     Search MCD19A2.061 for the most recent valid granule within a 7-day
     lookback of `date_str`.  Download the granule, extract QA-filtered AOD
     at (lat, lon), delete the file, return (aod_value, actual_date).
-    Returns (None, None) on any failure or cloud cover.
+    Returns (None, None) when no satellite data is available (cloud cover, no granule).
+    Logs and re-raises hard failures (auth error, download error) so they appear in
+    cloud logs rather than being silently converted to "no data".
     """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
     AOD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     # Determine tile
     tp = latlon_to_tile_pixel(lat, lon)
     tid = tile_id(tp.h, tp.v)
 
-    # Login (idempotent)
-    try:
-        earthaccess_login()
-    except Exception:
-        return None, None
+    # Login — must succeed before search; propagate auth errors to caller
+    earthaccess_login()
 
-    # Find granule
+    # Find granule — raises on CMR failure; returns (None, None) for genuine no-data
     granule, granule_date = find_granule_for_date(tid, date_str, lookback_days=7)
     if granule is None:
         return None, None
 
-    # Download
+    # Download — raises RuntimeError on failure
     hdf_path = download_granule(granule, AOD_CACHE_DIR)
-    if hdf_path is None:
-        return None, None
 
     # Extract
     try:

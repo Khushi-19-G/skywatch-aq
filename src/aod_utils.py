@@ -112,7 +112,10 @@ def find_granule_for_date(
     Strategy: search CMR for the full lookback window, filter filenames
     to the correct tile, pick the latest date <= target_date.
     """
+    import logging as _logging
     import earthaccess as _ea
+
+    _log = _logging.getLogger(__name__)
 
     target = datetime.date.fromisoformat(target_date_str)
     window_start = target - datetime.timedelta(days=lookback_days - 1)
@@ -124,6 +127,16 @@ def find_granule_for_date(
     lon_min = (h - 18) * 10
     lon_max = lon_min + 10
 
+    _log.info(
+        "[aod] CMR search: tile=%s temporal=(%s, %s) bbox=(%s,%s,%s,%s)",
+        tile, window_start.isoformat(), target.isoformat(),
+        lon_min, lat_min, lon_max, lat_max,
+    )
+    print(
+        f"[aod] CMR search: tile={tile} temporal=({window_start.isoformat()}, "
+        f"{target.isoformat()}) bbox=({lon_min},{lat_min},{lon_max},{lat_max})"
+    )
+
     try:
         results = _ea.search_data(
             short_name="MCD19A2",
@@ -134,6 +147,9 @@ def find_granule_for_date(
         )
     except Exception as exc:
         raise RuntimeError(f"CMR granule search failed: {exc}") from exc
+
+    _log.info("[aod] CMR returned %d raw results for tile=%s", len(results), tile)
+    print(f"[aod] CMR returned {len(results)} raw results for tile={tile}")
 
     # Build date->granule map filtered to this tile
     by_date: dict[str, object] = {}
@@ -172,13 +188,15 @@ def download_granule(
     granule,
     cache_dir: pathlib.Path,
     retries: int = 3,
-) -> pathlib.Path | None:
-    """Download one granule to cache_dir. Skip if already present. Returns local path."""
+) -> pathlib.Path:
+    """Download one granule to cache_dir. Skip if already present. Returns local path.
+    Raises RuntimeError if the granule has no URLs or all download attempts fail.
+    """
     import earthaccess as _ea
 
     urls = granule.data_links()
     if not urls:
-        return None
+        raise RuntimeError("Granule has no data URLs — cannot download.")
     filename = urls[0].split("/")[-1]
     dest = cache_dir / filename
     if dest.exists() and dest.stat().st_size > 0:
