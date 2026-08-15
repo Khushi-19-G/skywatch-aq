@@ -73,18 +73,24 @@ def tile_id(h: int, v: int) -> str:
 def earthaccess_login() -> None:
     """
     Login to NASA Earthdata using environment-strategy credentials.
-    Reads EARTHDATA_USERNAME / EARTHDATA_PASSWORD from .env if not already
-    set in os.environ.  Safe to call multiple times (earthaccess is idempotent).
+
+    On Streamlit Cloud there is no .env file and no cached ~/.netrc; credentials
+    are expected to already be in os.environ (placed there by app.py's bootstrap
+    block via st.secrets).  Locally, app.py's load_dotenv call also pre-populates
+    os.environ, so we just call earthaccess with strategy="environment" directly.
+
+    Raises RuntimeError if the required env-vars are missing or login fails, so
+    callers get a real error message rather than a silent empty result.
     """
-    from dotenv import load_dotenv
     import earthaccess as _ea
 
-    load_dotenv(override=True)
-    for key in ("EARTHDATA_USERNAME", "EARTHDATA_PASSWORD"):
-        val = os.getenv(key, "")
-        if val:
-            os.environ[key] = val
-
+    user = os.environ.get("EARTHDATA_USERNAME", "")
+    pwd  = os.environ.get("EARTHDATA_PASSWORD", "")
+    if not user or not pwd:
+        raise RuntimeError(
+            "EARTHDATA_USERNAME / EARTHDATA_PASSWORD not found in os.environ. "
+            "Set them in Streamlit Cloud Secrets or in your local .env file."
+        )
     _ea.login(strategy="environment")
 
 
@@ -126,8 +132,8 @@ def find_granule_for_date(
             bounding_box=(lon_min, lat_min, lon_max, lat_max),
             count=1000,
         )
-    except Exception:
-        return None, None
+    except Exception as exc:
+        raise RuntimeError(f"CMR granule search failed: {exc}") from exc
 
     # Build date->granule map filtered to this tile
     by_date: dict[str, object] = {}
@@ -177,6 +183,7 @@ def download_granule(
     dest = cache_dir / filename
     if dest.exists() and dest.stat().st_size > 0:
         return dest
+    last_exc: Exception | None = None
     for attempt in range(retries):
         try:
             files = _ea.download([granule], local_path=str(cache_dir))
@@ -185,10 +192,13 @@ def download_granule(
                 if p.exists() and p.stat().st_size > 0:
                     return p
         except Exception as exc:
+            last_exc = exc
             wait = 15 * (attempt + 1)
             if attempt < retries - 1:
                 time.sleep(wait)
-    return None
+    raise RuntimeError(
+        f"Granule download failed after {retries} attempts: {last_exc}"
+    )
 
 
 # ---------------------------------------------------------------------------

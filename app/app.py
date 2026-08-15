@@ -22,26 +22,21 @@ import streamlit as st
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
-# Bootstrap: load .env and push creds into os.environ so earthaccess finds them
+# Bootstrap: load .env locally; on Streamlit Cloud pull from st.secrets.
+# This runs before any src/ imports so earthaccess and OpenAQ both see creds.
 # ---------------------------------------------------------------------------
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-load_dotenv(_REPO_ROOT / ".env", override=True)
-for _k in ("EARTHDATA_USERNAME", "EARTHDATA_PASSWORD"):
-    _v = os.getenv(_k, "")
-    if _v:
-        os.environ[_k] = _v
+load_dotenv(_REPO_ROOT / ".env", override=False)   # no-op if file absent (cloud)
 
-# Bridge Streamlit Cloud secrets into env vars (no-op locally)
-
+# Streamlit Cloud: push secrets into os.environ so downstream code (earthaccess,
+# aod_utils, map_utils) can read them via os.getenv without knowing about st.secrets.
+_SECRET_KEYS = ("EARTHDATA_USERNAME", "EARTHDATA_PASSWORD", "OPENAQ_API_KEY")
 try:
-    for _k in ("EARTHDATA_USERNAME", "EARTHDATA_PASSWORD", "OPENAQ_API_KEY", "HF_TOKEN"):
+    for _k in _SECRET_KEYS:
         if _k in st.secrets and not os.environ.get(_k):
             os.environ[_k] = st.secrets[_k]
 except Exception:
-    pass
-
-st.caption(f"debug: ED_user={bool(os.environ.get('EARTHDATA_USERNAME'))} ED_pass={bool(os.environ.get('EARTHDATA_PASSWORD'))}")
-
+    pass  # st.secrets not available outside Streamlit runtime (e.g. local CLI)
 
 # Add src/ to path for aod_utils + map_utils
 import sys
@@ -812,10 +807,16 @@ for today only and is rebuilt if stale.
                         cells, exposure, advisory = fcache
                         aod_date_used = None
                     else:
-                        result_fc = build_forecast_map(
-                            map_region_key, map_date_str, bundle, progress_cb=_progress
-                        )
-                        cells, exposure, aod_date_used, advisory = result_fc
+                        try:
+                            result_fc = build_forecast_map(
+                                map_region_key, map_date_str, bundle, progress_cb=_progress
+                            )
+                            cells, exposure, aod_date_used, advisory = result_fc
+                        except Exception as _fc_err:
+                            progress_box.empty()
+                            st.error(f"Forecast map build failed: {_fc_err}", icon="🚨")
+                            st.exception(_fc_err)
+                            st.stop()
 
                 progress_box.empty()
 
@@ -850,20 +851,26 @@ for today only and is rebuilt if stale.
                                 bbox = REGIONS[map_region_key].get("bbox")
                                 exposure = compute_exposure(cells, pop_grid, region_bbox=bbox)
                     else:
-                        result = build_region_map(
-                            map_region_key, map_date_str, bundle, progress_cb=_progress
-                        )
-                        if result:
-                            cells, exposure, advisory = result
-                        else:
-                            cells, exposure, advisory = [], {"available": False}, {}
+                        try:
+                            cells, exposure, advisory = build_region_map(
+                                map_region_key, map_date_str, bundle, progress_cb=_progress
+                            )
+                        except Exception as _build_err:
+                            progress_box.empty()
+                            st.error(
+                                f"Map build failed: {_build_err}",
+                                icon="🚨",
+                            )
+                            st.exception(_build_err)
+                            st.stop()
 
                 progress_box.empty()
 
                 if not cells:
                     st.warning(
                         "No valid satellite data for this region and date. "
-                        "The entire tile may be under cloud cover. Try a different date.",
+                        "The entire tile may be under cloud cover or there is a data gap "
+                        "in the NASA archive. Try a different date.",
                         icon="☁️",
                     )
                 else:

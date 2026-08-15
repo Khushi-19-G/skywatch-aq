@@ -9,8 +9,10 @@ Public API
 ----------
   REGIONS          -- dict of region metadata (name, tile_id, centre, etc.)
   build_region_map(region_key, date_str, model_bundle, progress_cb=None)
-      -> list[dict]  each dict: {lat, lon, aod, pm25, band, band_label, band_color}
-         Returns empty list if granule unavailable.
+      -> (cells, exposure, advisory)
+         cells: list[dict]  each dict: {lat, lon, aod, pm25, band, band_label, band_color}
+         Returns ([], {available:False}, {}) if granule unavailable (cloud/data gap).
+         Raises RuntimeError on auth, download, or HDF failures.
   load_cached_map(region_key, date_str) -> list[dict] | None
   save_cached_map(region_key, date_str, cells)
 
@@ -32,11 +34,15 @@ Weather
 import csv
 import datetime
 import json
+import logging
 import math
 import pathlib
 import os
 import sys
+import tempfile
 import time
+
+logger = logging.getLogger(__name__)
 
 import requests
 import numpy as np
@@ -185,8 +191,7 @@ def extract_aod_grid(
     try:
         ds = nc4.Dataset(str(hdf_path))
     except Exception as e:
-        print(f"  [HDF open error] {e}")
-        return []
+        raise RuntimeError(f"Failed to open HDF granule {hdf_path.name}: {e}") from e
 
     cells: list[dict] = []
     try:
@@ -465,7 +470,8 @@ def save_cached_map(region_key: str, date_str: str,
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-HDF_TMP = pathlib.Path(os.environ.get("TEMP", "/tmp")) / "skywatch_map_hdf"
+# Use the system temp dir — guaranteed writable on every platform (local and cloud).
+HDF_TMP = pathlib.Path(tempfile.gettempdir()) / "skywatch_map_hdf"
 
 
 def build_region_map(
@@ -473,15 +479,20 @@ def build_region_map(
     date_str: str,
     model_bundle: dict,
     progress_cb=None,   # callable(str) for status messages
-) -> list[dict]:
+) -> tuple[list[dict], dict, dict]:
     """
     Full pipeline: find granule -> download -> extract AOD grid ->
-    fetch weather -> predict -> cache -> return cells.
+    fetch weather -> predict -> cache -> return (cells, exposure, advisory).
 
-    Returns [] if no granule available (cloud gap for entire tile).
+    Returns ([], {"available": False}, {}) when no granule is available for the date
+    (genuine cloud gap or archive data gap — NOT an error).
+
+    Raises RuntimeError for hard failures (auth, download, HDF open) so the caller
+    can surface the real error message instead of silently showing "No data".
     """
     def log(msg: str) -> None:
         print(msg)
+        logger.info(msg)
         if progress_cb:
             progress_cb(msg)
 
@@ -493,26 +504,19 @@ def build_region_map(
 
     log(f"[map] Region: {region['label']}  |  Date: {date_str}")
 
-    # 1. Find + download granule
+    # 1. Find + download granule — let exceptions propagate so app.py can display them
     log("[map] Authenticating with NASA Earthdata...")
-    try:
-        earthaccess_login()
-    except Exception as e:
-        log(f"[map] Login failed: {e}")
-        return []
+    earthaccess_login()   # raises RuntimeError with a clear message on failure
 
     log("[map] Searching for MCD19A2 granule (exact date)...")
     granule, g_date = find_granule_for_date(tile, date_str, lookback_days=1)
     if granule is None:
         log("[map] No granule found for this date (cloud gap or data missing).")
-        return []
+        return [], {"available": False}, {}
     log(f"[map] Found granule for {g_date}. Downloading...")
 
     HDF_TMP.mkdir(parents=True, exist_ok=True)
-    hdf_path = download_granule(granule, HDF_TMP)
-    if hdf_path is None:
-        log("[map] Download failed.")
-        return []
+    hdf_path = download_granule(granule, HDF_TMP)   # raises RuntimeError on failure
     log(f"[map] Downloaded: {hdf_path.name} ({hdf_path.stat().st_size // 1024:,} KB)")
 
     # 2. Extract AOD grid
@@ -530,7 +534,7 @@ def build_region_map(
 
     if not cells:
         log("[map] All cells cloudy — no valid AOD for this date.")
-        return []
+        return [], {"available": False}, {}
 
     # 3. Weather for the grid
     log("[map] Building weather grid and fetching from Open-Meteo (batch)...")

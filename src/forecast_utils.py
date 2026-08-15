@@ -193,11 +193,7 @@ def build_persisted_aod_grid(
                     - datetime.timedelta(days=1)).isoformat()
 
     log(f"[forecast] Searching for recent AOD (up to {AOD_LOOKBACK_DAYS} days before {forecast_date_str})...")
-    try:
-        earthaccess_login()
-    except Exception as e:
-        log(f"[forecast] Login failed: {e}")
-        return [], None
+    earthaccess_login()   # raises RuntimeError with a clear message on failure
 
     granule, aod_date = find_granule_for_date(tile, lookback_end, lookback_days=AOD_LOOKBACK_DAYS)
     if granule is None:
@@ -206,10 +202,7 @@ def build_persisted_aod_grid(
 
     log(f"[forecast] Using AOD from {aod_date} (persistence assumption). Downloading...")
     HDF_TMP.mkdir(parents=True, exist_ok=True)
-    hdf_path = download_granule(granule, HDF_TMP)
-    if hdf_path is None:
-        log("[forecast] Download failed.")
-        return [], None
+    hdf_path = download_granule(granule, HDF_TMP)   # raises RuntimeError on failure
     log(f"[forecast] Downloaded: {hdf_path.name} ({hdf_path.stat().st_size // 1024:,} KB)")
 
     cells = extract_aod_grid(hdf_path, h_tile, v_tile, step=GRID_STEP)
